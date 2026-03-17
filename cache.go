@@ -5,7 +5,7 @@ package gincache
 import (
 	"bytes"
 	"encoding/json"
-	"gincache/persist"
+
 	"hash/fnv"
 	"net/http"
 	"sort"
@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gtkit/gincache/persist"
 	"golang.org/x/sync/singleflight"
 )
 

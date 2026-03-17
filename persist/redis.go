@@ -8,13 +8,13 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// RedisStore Redis 缓存存储
+// RedisStore Redis 缓存存储.
 type RedisStore struct {
 	client    redis.Cmdable
 	keyPrefix string
 }
 
-// RedisStoreOption Redis 存储选项
+// RedisStoreOption Redis 存储选项.
 type RedisStoreOption func(*RedisStore)
 
 // WithKeyPrefix 设置 Key 前缀
@@ -24,7 +24,7 @@ func WithKeyPrefix(prefix string) RedisStoreOption {
 	}
 }
 
-// NewRedisStore 创建 Redis 存储
+// NewRedisStore 创建 Redis 存储.
 // 支持 *redis.Client, *redis.ClusterClient, *redis.Ring
 func NewRedisStore(client redis.Cmdable, opts ...RedisStoreOption) *RedisStore {
 	s := &RedisStore{
@@ -41,7 +41,7 @@ func (s *RedisStore) key(k string) string {
 	return s.keyPrefix + k
 }
 
-// Get 从 Redis 获取缓存
+// Get 从 Redis 获取缓存.
 func (s *RedisStore) Get(key string, value any) error {
 	ctx := context.Background()
 	data, err := s.client.Get(ctx, s.key(key)).Bytes()
@@ -54,7 +54,7 @@ func (s *RedisStore) Get(key string, value any) error {
 	return json.Unmarshal(data, value)
 }
 
-// Set 设置 Redis 缓存
+// Set 设置 Redis 缓存.
 func (s *RedisStore) Set(key string, value any, expire time.Duration) error {
 	ctx := context.Background()
 	data, err := json.Marshal(value)
@@ -64,13 +64,13 @@ func (s *RedisStore) Set(key string, value any, expire time.Duration) error {
 	return s.client.Set(ctx, s.key(key), data, expire).Err()
 }
 
-// Delete 删除 Redis 缓存
+// Delete 删除 Redis 缓存.
 func (s *RedisStore) Delete(key string) error {
 	ctx := context.Background()
 	return s.client.Del(ctx, s.key(key)).Err()
 }
 
-// DeletePattern 按模式删除缓存
+// DeletePattern 按模式删除缓存.
 // 注意：生产环境慎用 KEYS 命令，建议使用 SCAN
 func (s *RedisStore) DeletePattern(pattern string) error {
 	ctx := context.Background()

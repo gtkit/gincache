@@ -6,10 +6,10 @@ import (
 	"time"
 )
 
-// ErrCacheMiss 缓存未命中错误
+// ErrCacheMiss 缓存未命中错误.
 var ErrCacheMiss = errors.New("cache: key not found")
 
-// CacheStore 缓存存储接口
+// CacheStore 缓存存储接口.
 type CacheStore interface {
 	// Get 获取缓存，如果不存在返回 ErrCacheMiss
 	Get(key string, value any) error

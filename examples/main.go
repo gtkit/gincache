@@ -2,8 +2,7 @@ package main
 
 import (
 	"fmt"
-	"gincache"
-	"gincache/persist"
+
 	"log"
 	"net/http"
 	"strconv"
@@ -11,6 +10,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gtkit/gincache"
+	"github.com/gtkit/gincache/persist"
 	"github.com/redis/go-redis/v9"
 )
 

@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// MemoryStore 内存缓存存储
+// MemoryStore 内存缓存存储.
 // 使用 sync.Map 实现，适合读多写少场景
 type MemoryStore struct {
 	data              sync.Map
@@ -20,7 +20,7 @@ type memoryItem struct {
 	expiration int64 // Unix nano
 }
 
-// MemoryStoreOption 内存存储选项
+// MemoryStoreOption 内存存储选项.
 type MemoryStoreOption func(*MemoryStore)
 
 // WithCleanupInterval 设置清理间隔
@@ -30,7 +30,7 @@ func WithCleanupInterval(interval time.Duration) MemoryStoreOption {
 	}
 }
 
-// NewMemoryStore 创建内存存储
+// NewMemoryStore 创建内存存储.
 func NewMemoryStore(defaultExpiration time.Duration, opts ...MemoryStoreOption) *MemoryStore {
 	s := &MemoryStore{
 		defaultExpiration: defaultExpiration,
@@ -47,7 +47,7 @@ func NewMemoryStore(defaultExpiration time.Duration, opts ...MemoryStoreOption) 
 	return s
 }
 
-// Get 从内存获取缓存
+// Get 从内存获取缓存.
 func (s *MemoryStore) Get(key string, value any) error {
 	v, ok := s.data.Load(key)
 	if !ok {
@@ -65,7 +65,7 @@ func (s *MemoryStore) Get(key string, value any) error {
 	return json.Unmarshal(item.value, value)
 }
 
-// Set 设置内存缓存
+// Set 设置内存缓存.
 func (s *MemoryStore) Set(key string, value any, expire time.Duration) error {
 	data, err := json.Marshal(value)
 	if err != nil {
@@ -89,13 +89,13 @@ func (s *MemoryStore) Set(key string, value any, expire time.Duration) error {
 	return nil
 }
 
-// Delete 删除内存缓存
+// Delete 删除内存缓存.
 func (s *MemoryStore) Delete(key string) error {
 	s.data.Delete(key)
 	return nil
 }
 
-// Flush 清空所有缓存
+// Flush 清空所有缓存.
 func (s *MemoryStore) Flush() {
 	s.data.Range(func(key, _ any) bool {
 		s.data.Delete(key)
@@ -103,12 +103,12 @@ func (s *MemoryStore) Flush() {
 	})
 }
 
-// Close 关闭存储，停止清理协程
+// Close 关闭存储，停止清理协程.
 func (s *MemoryStore) Close() {
 	close(s.stopCleanup)
 }
 
-// cleanupLoop 后台清理过期数据
+// cleanupLoop 后台清理过期数据.
 func (s *MemoryStore) cleanupLoop() {
 	ticker := time.NewTicker(s.cleanupInterval)
 	defer ticker.Stop()
@@ -134,7 +134,7 @@ func (s *MemoryStore) deleteExpired() {
 	})
 }
 
-// Stats 获取统计信息
+// Stats 获取统计信息.
 func (s *MemoryStore) Stats() map[string]int64 {
 	var count, expired int64
 	now := time.Now().UnixNano()
