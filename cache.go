@@ -283,12 +283,61 @@ func (m *Middleware) handleWithParams(c *gin.Context, cacheKey string, store per
 	}
 
 	// 4. 使用 singleflight 防止缓存击穿
-	m.executeWithSingleFlight(c, cacheKey, store, duration)
+	m.executeWithSingleFlightSafe(c, cacheKey, store, duration)
 }
 
 func (m *Middleware) executeAndCache(c *gin.Context, cacheKey string, store persist.CacheStore, duration time.Duration) {
 	resp := m.executeHandler(c)
 	m.cacheResponse(cacheKey, resp, store, duration)
+}
+
+func (m *Middleware) executeWithSingleFlightSafe(c *gin.Context, cacheKey string, store persist.CacheStore, duration time.Duration) {
+	if m.cfg.singleFlightForgetTimeout > 0 {
+		time.AfterFunc(m.cfg.singleFlightForgetTimeout, func() {
+			m.sfGroup.Forget(cacheKey)
+		})
+	}
+
+	var executedHandler atomic.Bool
+
+	result, err, shared := m.sfGroup.Do(cacheKey, func() (any, error) {
+		var cached ResponseCache
+		if err := store.Get(cacheKey, &cached); err == nil {
+			return &cached, nil
+		}
+
+		executedHandler.Store(true)
+		resp := m.executeHandler(c)
+		m.cacheResponse(cacheKey, resp, store, duration)
+
+		return resp, nil
+	})
+	if err != nil {
+		if m.cfg.logger != nil {
+			m.cfg.logger.Errorf("gincache: singleflight error: %v", err)
+		}
+		c.Next()
+		return
+	}
+
+	resp, ok := result.(*ResponseCache)
+	if !ok {
+		c.Next()
+		return
+	}
+
+	if !executedHandler.Load() {
+		if shared && m.cfg.shareSingleFlightCallback != nil {
+			m.cfg.shareSingleFlightCallback(c)
+		}
+		m.writeResponse(c, resp)
+		c.Abort()
+		return
+	}
+
+	if shared && m.cfg.shareSingleFlightCallback != nil {
+		m.cfg.shareSingleFlightCallback(c)
+	}
 }
 
 func (m *Middleware) executeWithSingleFlight(c *gin.Context, cacheKey string, store persist.CacheStore, duration time.Duration) {

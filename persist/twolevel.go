@@ -10,58 +10,58 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// TwoLevelStore 两级缓存存储（生产级实现）
-// L1: 本地内存（热点数据，低延迟，进程内有效）
-// L2: Redis（容量大，跨实例共享）
-//
-// 特点：
-// - 读取时先查本地，再查 Redis
-// - 写入时同时写本地和 Redis
-// - singleflight 防止缓存击穿
-// - 本地缓存 TTL 比 Redis 短，保证数据一致性
+// TwoLevelStore 是一个面向生产的两级缓存实现。
+// L1 是可插拔的本地缓存，默认使用 MemoryStore。
+// L2 是 Redis，并作为共享缓存的事实来源。
 type TwoLevelStore struct {
-	local     *MemoryStore
+	local     LocalStore
 	remote    *RedisStore
 	localTTL  time.Duration
 	remoteTTL time.Duration
 	sf        singleflight.Group
 	keyPrefix string
 
-	// 统计
 	localHit  atomic.Uint64
 	remoteHit atomic.Uint64
 	miss      atomic.Uint64
 }
 
-// TwoLevelStoreOption 两级缓存选项
+// TwoLevelStoreOption 用于配置 TwoLevelStore。
 type TwoLevelStoreOption func(*TwoLevelStore)
 
-// WithLocalTTL 设置本地缓存 TTL
+// WithLocalTTL 设置本地缓存默认 TTL。
 func WithLocalTTL(ttl time.Duration) TwoLevelStoreOption {
 	return func(s *TwoLevelStore) {
 		s.localTTL = ttl
 	}
 }
 
-// WithRemoteTTL 设置远程缓存 TTL
+// WithRemoteTTL 设置远端 Redis 默认 TTL。
 func WithRemoteTTL(ttl time.Duration) TwoLevelStoreOption {
 	return func(s *TwoLevelStore) {
 		s.remoteTTL = ttl
 	}
 }
 
-// WithTwoLevelKeyPrefix 设置 Key 前缀
+// WithTwoLevelKeyPrefix 设置两级缓存使用的 Redis key 前缀。
 func WithTwoLevelKeyPrefix(prefix string) TwoLevelStoreOption {
 	return func(s *TwoLevelStore) {
 		s.keyPrefix = prefix
 	}
 }
 
-// NewTwoLevelStore 创建两级缓存存储
+// WithLocalStore 注入自定义本地缓存实现。
+func WithLocalStore(local LocalStore) TwoLevelStoreOption {
+	return func(s *TwoLevelStore) {
+		s.local = local
+	}
+}
+
+// NewTwoLevelStore 创建一个 L1 可插拔、L2 为 Redis 的两级缓存。
 func NewTwoLevelStore(redisClient redis.Cmdable, opts ...TwoLevelStoreOption) *TwoLevelStore {
 	s := &TwoLevelStore{
-		localTTL:  30 * time.Second, // 默认本地 30 秒
-		remoteTTL: 5 * time.Minute,  // 默认远程 5 分钟
+		localTTL:  30 * time.Second,
+		remoteTTL: 5 * time.Minute,
 		keyPrefix: "gincache:2l:",
 	}
 
@@ -69,16 +69,15 @@ func NewTwoLevelStore(redisClient redis.Cmdable, opts ...TwoLevelStoreOption) *T
 		opt(s)
 	}
 
-	// 创建本地存储（清理间隔为 TTL 的一半）
-	cleanupInterval := s.localTTL / 2
-	if cleanupInterval < 10*time.Second {
-		cleanupInterval = 10 * time.Second
+	if s.local == nil {
+		cleanupInterval := s.localTTL / 2
+		if cleanupInterval < 10*time.Second {
+			cleanupInterval = 10 * time.Second
+		}
+		s.local = NewMemoryStore(s.localTTL, WithCleanupInterval(cleanupInterval))
 	}
-	s.local = NewMemoryStore(s.localTTL, WithCleanupInterval(cleanupInterval))
 
-	// 创建远程存储
 	s.remote = NewRedisStore(redisClient, WithKeyPrefix(s.keyPrefix))
-
 	return s
 }
 
@@ -86,23 +85,19 @@ func (s *TwoLevelStore) key(k string) string {
 	return s.keyPrefix + k
 }
 
-// Get 获取缓存：本地 -> Redis
+// Get 优先读取本地缓存，未命中时回源 Redis，并在远端命中后回填本地。
 func (s *TwoLevelStore) Get(key string, value any) error {
-	// 1. 先查本地缓存
 	if err := s.local.Get(key, value); err == nil {
 		s.localHit.Add(1)
 		return nil
 	}
 
-	// 2. 查 Redis（使用 singleflight 防止并发穿透）
 	result, err, _ := s.sf.Do(key, func() (any, error) {
-		// Double-check 本地缓存
 		var temp json.RawMessage
 		if err := s.local.Get(key, &temp); err == nil {
 			return temp, nil
 		}
 
-		// 查 Redis
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 
@@ -114,15 +109,13 @@ func (s *TwoLevelStore) Get(key string, value any) error {
 			return nil, err
 		}
 
-		// 回填本地缓存
 		var cached any
 		if json.Unmarshal(data, &cached) == nil {
-			s.local.Set(key, cached, s.localTTL)
+			_ = s.local.Set(key, cached, s.localTTL)
 		}
 
 		return data, nil
 	})
-
 	if err != nil {
 		s.miss.Add(1)
 		return err
@@ -130,7 +123,6 @@ func (s *TwoLevelStore) Get(key string, value any) error {
 
 	s.remoteHit.Add(1)
 
-	// 反序列化
 	switch v := result.(type) {
 	case []byte:
 		return json.Unmarshal(v, value)
@@ -142,64 +134,57 @@ func (s *TwoLevelStore) Get(key string, value any) error {
 	}
 }
 
-// Set 设置缓存：同时写入本地和 Redis
+// Set 先写 Redis，成功后再写本地缓存。
 func (s *TwoLevelStore) Set(key string, value any, expire time.Duration) error {
 	return s.SetWithContext(context.Background(), key, value, expire)
 }
 
-// SetWithContext 带 Context 的设置缓存
+// SetWithContext 先写 Redis，再写本地缓存，避免远端失败导致本地脏数据。
 func (s *TwoLevelStore) SetWithContext(ctx context.Context, key string, value any, expire time.Duration) error {
-	// 确定 TTL
 	localExpire := s.localTTL
 	remoteExpire := expire
 	if remoteExpire == 0 {
 		remoteExpire = s.remoteTTL
 	}
 
-	// 本地 TTL 不应超过远程 TTL
 	if localExpire > remoteExpire {
 		localExpire = remoteExpire
 	}
 
-	// 写入本地缓存
-	if err := s.local.Set(key, value, localExpire); err != nil {
+	if err := s.remote.SetWithContext(ctx, key, value, remoteExpire); err != nil {
 		return err
 	}
 
-	// 写入 Redis
-	return s.remote.SetWithContext(ctx, key, value, remoteExpire)
+	return s.local.Set(key, value, localExpire)
 }
 
-// Delete 删除缓存：同时删除本地和 Redis
+// Delete 同时删除本地缓存和 Redis 中的单个 key。
 func (s *TwoLevelStore) Delete(key string) error {
-	// 删除本地
-	s.local.Delete(key)
-
-	// 删除 Redis
+	_ = s.local.Delete(key)
 	return s.remote.Delete(key)
 }
 
-// DeletePattern 按模式删除缓存
+// DeletePattern 先尽力删除本地缓存，再删除 Redis 中匹配模式的 key。
 func (s *TwoLevelStore) DeletePattern(ctx context.Context, pattern string) (int64, error) {
-	// 删除本地
-	s.local.DeletePattern(ctx, pattern)
-
-	// 删除 Redis
+	if local, ok := s.local.(LocalStoreWithPattern); ok {
+		_, _ = local.DeletePattern(ctx, pattern)
+	}
 	return s.remote.DeletePattern(ctx, pattern)
 }
 
-// InvalidateLocal 仅失效本地缓存
-// 用于收到 Redis Pub/Sub 消息时清理本地缓存
+// InvalidateLocal 只删除本地缓存中的单个 key。
 func (s *TwoLevelStore) InvalidateLocal(key string) {
-	s.local.Delete(key)
+	_ = s.local.Delete(key)
 }
 
-// InvalidateLocalPattern 按模式失效本地缓存
+// InvalidateLocalPattern 在本地缓存支持按模式删除时，清理本地匹配 key。
 func (s *TwoLevelStore) InvalidateLocalPattern(pattern string) {
-	s.local.DeletePattern(context.Background(), pattern)
+	if local, ok := s.local.(LocalStoreWithPattern); ok {
+		_, _ = local.DeletePattern(context.Background(), pattern)
+	}
 }
 
-// Stats 获取统计信息
+// Stats 返回两级缓存的聚合统计信息。
 func (s *TwoLevelStore) Stats() map[string]int64 {
 	localStats := s.local.Stats()
 
@@ -228,7 +213,7 @@ func (s *TwoLevelStore) Stats() map[string]int64 {
 	}
 }
 
-// ResetStats 重置统计
+// ResetStats 重置两级缓存的聚合计数和本地缓存计数。
 func (s *TwoLevelStore) ResetStats() {
 	s.localHit.Store(0)
 	s.remoteHit.Store(0)
@@ -236,17 +221,17 @@ func (s *TwoLevelStore) ResetStats() {
 	s.local.ResetStats()
 }
 
-// Close 关闭存储
+// Close 关闭本地缓存。
 func (s *TwoLevelStore) Close() error {
 	return s.local.Close()
 }
 
-// LocalStore 获取本地存储（用于调试）
-func (s *TwoLevelStore) LocalStore() *MemoryStore {
+// LocalStore 返回当前配置的本地缓存实现。
+func (s *TwoLevelStore) LocalStore() LocalStore {
 	return s.local
 }
 
-// RemoteStore 获取远程存储（用于调试）
+// RemoteStore 返回 Redis 实现的二级缓存。
 func (s *TwoLevelStore) RemoteStore() *RedisStore {
 	return s.remote
 }
