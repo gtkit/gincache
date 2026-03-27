@@ -3,6 +3,7 @@ package persist
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -131,7 +132,7 @@ func (s *MemoryStore) DeletePattern(_ context.Context, pattern string) (int64, e
 
 	s.data.Range(func(k, _ any) bool {
 		key := k.(string)
-		if len(key) >= len(prefix) && key[:len(prefix)] == prefix {
+		if strings.HasPrefix(key, prefix) {
 			s.data.Delete(key)
 			deleted++
 		}

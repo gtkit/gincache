@@ -3,6 +3,7 @@ package persist
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -70,19 +71,12 @@ func NewTwoLevelStore(redisClient redis.Cmdable, opts ...TwoLevelStoreOption) *T
 	}
 
 	if s.local == nil {
-		cleanupInterval := s.localTTL / 2
-		if cleanupInterval < 10*time.Second {
-			cleanupInterval = 10 * time.Second
-		}
+		cleanupInterval := max(s.localTTL/2, 10*time.Second)
 		s.local = NewMemoryStore(s.localTTL, WithCleanupInterval(cleanupInterval))
 	}
 
 	s.remote = NewRedisStore(redisClient, WithKeyPrefix(s.keyPrefix))
 	return s
-}
-
-func (s *TwoLevelStore) key(k string) string {
-	return s.keyPrefix + k
 }
 
 // Get 优先读取本地缓存，未命中时回源 Redis，并在远端命中后回填本地。
@@ -98,23 +92,15 @@ func (s *TwoLevelStore) Get(key string, value any) error {
 			return temp, nil
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-
-		data, err := s.remote.Client().Get(ctx, s.remote.key(key)).Bytes()
-		if err == redis.Nil {
-			return nil, ErrCacheMiss
-		}
+		var data json.RawMessage
+		err := s.remote.Get(key, &data)
 		if err != nil {
 			return nil, err
 		}
 
-		var cached any
-		if json.Unmarshal(data, &cached) == nil {
-			_ = s.local.Set(key, cached, s.localTTL)
-		}
+		_ = s.local.Set(key, data, s.localTTL)
 
-		return data, nil
+		return []byte(data), nil
 	})
 	if err != nil {
 		s.miss.Add(1)
@@ -129,7 +115,10 @@ func (s *TwoLevelStore) Get(key string, value any) error {
 	case json.RawMessage:
 		return json.Unmarshal(v, value)
 	default:
-		data, _ := json.Marshal(v)
+		data, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Errorf("gincache: unexpected singleflight result type %T: %w", v, err)
+		}
 		return json.Unmarshal(data, value)
 	}
 }
@@ -147,9 +136,7 @@ func (s *TwoLevelStore) SetWithContext(ctx context.Context, key string, value an
 		remoteExpire = s.remoteTTL
 	}
 
-	if localExpire > remoteExpire {
-		localExpire = remoteExpire
-	}
+	localExpire = min(localExpire, remoteExpire)
 
 	if err := s.remote.SetWithContext(ctx, key, value, remoteExpire); err != nil {
 		return err

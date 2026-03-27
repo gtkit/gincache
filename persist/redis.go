@@ -3,6 +3,7 @@ package persist
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -12,7 +13,6 @@ import (
 type RedisStore struct {
 	client       redis.Cmdable
 	keyPrefix    string
-	defaultCtx   context.Context
 	readTimeout  time.Duration
 	writeTimeout time.Duration
 }
@@ -47,7 +47,6 @@ func NewRedisStore(client redis.Cmdable, opts ...RedisStoreOption) *RedisStore {
 	s := &RedisStore{
 		client:       client,
 		keyPrefix:    "gincache:",
-		defaultCtx:   context.Background(),
 		readTimeout:  3 * time.Second,
 		writeTimeout: 3 * time.Second,
 	}
@@ -63,11 +62,11 @@ func (s *RedisStore) key(k string) string {
 
 // Get 从 Redis 获取缓存
 func (s *RedisStore) Get(key string, value any) error {
-	ctx, cancel := context.WithTimeout(s.defaultCtx, s.readTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), s.readTimeout)
 	defer cancel()
 
 	data, err := s.client.Get(ctx, s.key(key)).Bytes()
-	if err == redis.Nil {
+	if errors.Is(err, redis.Nil) {
 		return ErrCacheMiss
 	}
 	if err != nil {
@@ -78,7 +77,7 @@ func (s *RedisStore) Get(key string, value any) error {
 
 // Set 设置 Redis 缓存
 func (s *RedisStore) Set(key string, value any, expire time.Duration) error {
-	ctx, cancel := context.WithTimeout(s.defaultCtx, s.writeTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), s.writeTimeout)
 	defer cancel()
 	return s.SetWithContext(ctx, key, value, expire)
 }
@@ -94,7 +93,7 @@ func (s *RedisStore) SetWithContext(ctx context.Context, key string, value any, 
 
 // Delete 删除 Redis 缓存
 func (s *RedisStore) Delete(key string) error {
-	ctx, cancel := context.WithTimeout(s.defaultCtx, s.writeTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), s.writeTimeout)
 	defer cancel()
 	return s.client.Del(ctx, s.key(key)).Err()
 }
@@ -179,7 +178,7 @@ func (s *RedisStore) Ping(ctx context.Context) error {
 
 // Stats 获取统计信息
 func (s *RedisStore) Stats() map[string]int64 {
-	ctx, cancel := context.WithTimeout(s.defaultCtx, s.readTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), s.readTimeout)
 	defer cancel()
 
 	// 统计当前前缀下的 key 数量

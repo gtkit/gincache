@@ -5,9 +5,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -196,38 +195,14 @@ func Cache(store persist.CacheStore, expire time.Duration, opts ...Option) gin.H
 
 // CacheByRequestURI 按 URI 缓存.
 func CacheByRequestURI(store persist.CacheStore, expire time.Duration, opts ...Option) gin.HandlerFunc {
-	cfg := &Config{
-		singleFlightForgetTimeout: 10 * time.Second,
-	}
-	for _, opt := range opts {
-		opt(cfg)
-	}
-
-	m := &Middleware{store: store, defaultExpire: expire, cfg: cfg}
-
-	return func(c *gin.Context) {
-		uri := c.Request.RequestURI
-		if cfg.ignoreQueryOrder {
-			uri = normalizeURI(c.Request.URL.Path, c.Request.URL.RawQuery)
-		}
-		m.handleWithKey(c, uri)
-	}
+	m := New(store, expire, opts...)
+	return m.CacheByURI()
 }
 
 // CacheByRequestPath 按路径缓存.
 func CacheByRequestPath(store persist.CacheStore, expire time.Duration, opts ...Option) gin.HandlerFunc {
-	cfg := &Config{
-		singleFlightForgetTimeout: 10 * time.Second,
-	}
-	for _, opt := range opts {
-		opt(cfg)
-	}
-
-	m := &Middleware{store: store, defaultExpire: expire, cfg: cfg}
-
-	return func(c *gin.Context) {
-		m.handleWithKey(c, c.Request.URL.Path)
-	}
+	m := New(store, expire, opts...)
+	return m.CacheByPath()
 }
 
 // =========================================================================
@@ -338,64 +313,7 @@ func (m *Middleware) executeWithSingleFlightSafe(c *gin.Context, cacheKey string
 	if shared && m.cfg.shareSingleFlightCallback != nil {
 		m.cfg.shareSingleFlightCallback(c)
 	}
-}
-
-func (m *Middleware) executeWithSingleFlight(c *gin.Context, cacheKey string, store persist.CacheStore, duration time.Duration) {
-	// singleflight 超时控制
-	if m.cfg.singleFlightForgetTimeout > 0 {
-		time.AfterFunc(m.cfg.singleFlightForgetTimeout, func() {
-			m.sfGroup.Forget(cacheKey)
-		})
-	}
-
-	// 标记当前请求是否是首发请求
-	var isLeader atomic.Bool
-	isLeader.Store(true)
-
-	resultCh := m.sfGroup.DoChan(cacheKey, func() (any, error) {
-		// Double-check 缓存
-		var cached ResponseCache
-		if err := store.Get(cacheKey, &cached); err == nil {
-			isLeader.Store(false)
-			return &cached, nil
-		}
-
-		// 执行 Handler
-		resp := m.executeHandler(c)
-
-		// 缓存响应
-		m.cacheResponse(cacheKey, resp, store, duration)
-
-		return resp, nil
-	})
-
-	// 等待结果
-	result := <-resultCh
-	if result.Err != nil {
-		if m.cfg.logger != nil {
-			m.cfg.logger.Errorf("gincache: singleflight error: %v", result.Err)
-		}
-		c.Next()
-		return
-	}
-
-	resp, ok := result.Val.(*ResponseCache)
-	if !ok {
-		c.Next()
-		return
-	}
-
-	// 如果是共享结果（不是首发请求），需要写入响应
-	if result.Shared {
-		if m.cfg.shareSingleFlightCallback != nil {
-			m.cfg.shareSingleFlightCallback(c)
-		}
-		// 共享结果的请求需要手动写入响应
-		if !isLeader.Load() {
-			m.writeResponse(c, resp)
-			c.Abort()
-		}
-	}
+	c.Abort()
 }
 
 // =========================================================================
@@ -445,7 +363,9 @@ func (w *cachedWriter) Write(data []byte) (int, error) {
 		w.statusCode = http.StatusOK
 		w.written = true
 	}
-	w.body.Write(data)
+	if _, err := w.body.Write(data); err != nil {
+		return 0, err
+	}
 	return w.ResponseWriter.Write(data)
 }
 
@@ -454,7 +374,9 @@ func (w *cachedWriter) WriteString(s string) (int, error) {
 		w.statusCode = http.StatusOK
 		w.written = true
 	}
-	w.body.WriteString(s)
+	if _, err := w.body.WriteString(s); err != nil {
+		return 0, err
+	}
 	return w.ResponseWriter.WriteString(s)
 }
 
@@ -516,6 +438,7 @@ func (m *Middleware) cacheResponse(key string, resp *ResponseCache, store persis
 	}
 
 	// 写入缓存
+	// 使用独立于请求的 context，避免客户端取消导致缓存回填中断。
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
@@ -537,6 +460,9 @@ func (m *Middleware) shouldCache(resp *ResponseCache) bool {
 func (m *Middleware) writeResponse(c *gin.Context, resp *ResponseCache) {
 	// 设置响应头
 	for k, v := range resp.Header {
+		if k == "Content-Type" {
+			continue
+		}
 		c.Header(k, v)
 	}
 	c.Header("X-Cache", "HIT")
@@ -559,7 +485,7 @@ func normalizeURI(path, rawQuery string) string {
 		return path
 	}
 	params := strings.Split(rawQuery, "&")
-	sort.Strings(params)
+	slices.Sort(params)
 	return path + "?" + strings.Join(params, "&")
 }
 
@@ -567,12 +493,12 @@ func normalizeURI(path, rawQuery string) string {
 // 序列化
 // =========================================================================
 
-// Serialize 序列化响应缓存.
+// Serialize 序列化响应缓存，供自定义存储或跨进程传输场景复用。
 func Serialize(resp *ResponseCache) ([]byte, error) {
 	return json.Marshal(resp)
 }
 
-// Deserialize 反序列化响应缓存.
+// Deserialize 反序列化响应缓存，供自定义存储或跨进程传输场景复用。
 func Deserialize(data []byte) (*ResponseCache, error) {
 	var resp ResponseCache
 	if err := json.Unmarshal(data, &resp); err != nil {
@@ -581,11 +507,4 @@ func Deserialize(data []byte) (*ResponseCache, error) {
 	return &resp, nil
 }
 
-// =========================================================================
-// 错误定义
-// =========================================================================
-
-var (
-	ErrCacheMiss    = errors.New("cache: key not found")
-	ErrCacheExpired = errors.New("cache: key expired")
-)
+var ErrCacheMiss = persist.ErrCacheMiss

@@ -2,6 +2,7 @@ package ristrettoadapter
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -117,13 +118,44 @@ func TestDeletePattern(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := store.Get("user:1", &got); err != persist.ErrCacheMiss {
+	if err := store.Get("user:1", &got); !errors.Is(err, persist.ErrCacheMiss) {
 		t.Fatalf("Get user:1 err = %v, want %v", err, persist.ErrCacheMiss)
 	}
-	if err := store.Get("user:2", &got); err != persist.ErrCacheMiss {
+	if err := store.Get("user:2", &got); !errors.Is(err, persist.ErrCacheMiss) {
 		t.Fatalf("Get user:2 err = %v, want %v", err, persist.ErrCacheMiss)
 	}
 	if err := store.Get("order:1", &got); err != nil {
 		t.Fatalf("Get order:1 error: %v", err)
+	}
+}
+
+func TestGetMissDoesNotUntrackKey(t *testing.T) {
+	t.Parallel()
+
+	cache, err := ristretto.NewCache(&ristretto.Config[string, []byte]{
+		NumCounters: 1_000,
+		MaxCost:     1 << 20,
+		BufferItems: 64,
+	})
+	if err != nil {
+		t.Fatalf("NewCache error: %v", err)
+	}
+
+	store := New(cache)
+	store.trackKey("user:pending")
+
+	stats := store.Stats()
+	if stats["tracked"] != 1 {
+		t.Fatalf("tracked before miss = %d, want 1", stats["tracked"])
+	}
+
+	var got map[string]any
+	if err := store.Get("user:pending", &got); !errors.Is(err, persist.ErrCacheMiss) {
+		t.Fatalf("Get err = %v, want %v", err, persist.ErrCacheMiss)
+	}
+
+	stats = store.Stats()
+	if stats["tracked"] != 1 {
+		t.Fatalf("tracked after miss = %d, want 1", stats["tracked"])
 	}
 }

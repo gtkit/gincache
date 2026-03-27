@@ -2,6 +2,7 @@ package persist
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -34,7 +35,7 @@ func TestTwoLevelStoreSetDoesNotKeepLocalOnRemoteFailure(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := store.local.Get("user:1", &got); err != ErrCacheMiss {
+	if err := store.local.Get("user:1", &got); !errors.Is(err, ErrCacheMiss) {
 		t.Fatalf("local cache err = %v, want %v", err, ErrCacheMiss)
 	}
 }

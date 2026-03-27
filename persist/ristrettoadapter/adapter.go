@@ -91,7 +91,6 @@ func (s *Store) Get(key string, value any) error {
 	data, ok := s.cache.Get(key)
 	if !ok {
 		s.missCount.Add(1)
-		s.untrackKey(key)
 		return persist.ErrCacheMiss
 	}
 

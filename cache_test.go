@@ -43,15 +43,13 @@ func TestMiddlewareSingleflightSharesResponse(t *testing.T) {
 	var wg sync.WaitGroup
 	responses := make([]*httptest.ResponseRecorder, requestCount)
 
-	for i := 0; i < requestCount; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
+	for i := range requestCount {
+		wg.Go(func() {
 			req := httptest.NewRequest(http.MethodGet, "/items/42", nil)
 			rec := httptest.NewRecorder()
 			router.ServeHTTP(rec, req)
-			responses[idx] = rec
-		}(i)
+			responses[i] = rec
+		})
 	}
 
 	wg.Wait()
@@ -142,7 +140,7 @@ func TestMiddlewareCacheableStatusDefaults(t *testing.T) {
 		},
 	)
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
 	}
@@ -175,7 +173,7 @@ func TestMiddlewareCacheableStatusOverride(t *testing.T) {
 		},
 	)
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
 	}
