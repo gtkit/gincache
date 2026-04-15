@@ -129,6 +129,46 @@ func TestDeletePattern(t *testing.T) {
 	}
 }
 
+func TestDeletePatternMatchesWildcardInMiddle(t *testing.T) {
+	t.Parallel()
+
+	cache, err := ristretto.NewCache(&ristretto.Config[string, []byte]{
+		NumCounters: 1_000,
+		MaxCost:     1 << 20,
+		BufferItems: 64,
+	})
+	if err != nil {
+		t.Fatalf("NewCache error: %v", err)
+	}
+
+	store := New(cache, WithWait())
+
+	for key, value := range map[string]map[string]any{
+		"user:1:profile":  {"v": 1},
+		"user:2:profile":  {"v": 2},
+		"user:1:settings": {"v": 3},
+	} {
+		if err := store.Set(key, value, time.Minute); err != nil {
+			t.Fatalf("Set(%s) error: %v", key, err)
+		}
+	}
+
+	if _, err := store.DeletePattern(context.Background(), "user:*:profile"); err != nil {
+		t.Fatalf("DeletePattern error: %v", err)
+	}
+
+	var got map[string]any
+	if err := store.Get("user:1:profile", &got); !errors.Is(err, persist.ErrCacheMiss) {
+		t.Fatalf("Get user:1:profile err = %v, want %v", err, persist.ErrCacheMiss)
+	}
+	if err := store.Get("user:2:profile", &got); !errors.Is(err, persist.ErrCacheMiss) {
+		t.Fatalf("Get user:2:profile err = %v, want %v", err, persist.ErrCacheMiss)
+	}
+	if err := store.Get("user:1:settings", &got); err != nil {
+		t.Fatalf("Get user:1:settings error: %v", err)
+	}
+}
+
 func TestGetMissDoesNotUntrackKey(t *testing.T) {
 	t.Parallel()
 

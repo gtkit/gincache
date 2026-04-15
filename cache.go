@@ -26,6 +26,8 @@ type ResponseCache struct {
 	Status int               `json:"s"`
 	Header map[string]string `json:"h"`
 	Body   []byte            `json:"b"`
+
+	tooLarge bool `json:"-"`
 }
 
 // Strategy 缓存策略.
@@ -322,9 +324,11 @@ func (m *Middleware) executeWithSingleFlightSafe(c *gin.Context, cacheKey string
 
 type cachedWriter struct {
 	gin.ResponseWriter
-	body       *bytes.Buffer
-	statusCode int
-	written    bool
+	body        *bytes.Buffer
+	statusCode  int
+	written     bool
+	maxBodySize int64
+	overflowed  bool
 }
 
 var writerPool = sync.Pool{
@@ -335,18 +339,22 @@ var writerPool = sync.Pool{
 	},
 }
 
-func getWriter(w gin.ResponseWriter) *cachedWriter {
+func getWriter(w gin.ResponseWriter, maxBodySize int64) *cachedWriter {
 	cw := writerPool.Get().(*cachedWriter)
 	cw.ResponseWriter = w
 	cw.body.Reset()
 	cw.statusCode = 0
 	cw.written = false
+	cw.maxBodySize = maxBodySize
+	cw.overflowed = false
 	return cw
 }
 
 func putWriter(cw *cachedWriter) {
 	cw.ResponseWriter = nil
 	cw.body.Reset()
+	cw.maxBodySize = 0
+	cw.overflowed = false
 	writerPool.Put(cw)
 }
 
@@ -363,8 +371,10 @@ func (w *cachedWriter) Write(data []byte) (int, error) {
 		w.statusCode = http.StatusOK
 		w.written = true
 	}
-	if _, err := w.body.Write(data); err != nil {
-		return 0, err
+	if w.shouldBuffer(len(data)) {
+		if _, err := w.body.Write(data); err != nil {
+			return 0, err
+		}
 	}
 	return w.ResponseWriter.Write(data)
 }
@@ -374,8 +384,10 @@ func (w *cachedWriter) WriteString(s string) (int, error) {
 		w.statusCode = http.StatusOK
 		w.written = true
 	}
-	if _, err := w.body.WriteString(s); err != nil {
-		return 0, err
+	if w.shouldBuffer(len(s)) {
+		if _, err := w.body.WriteString(s); err != nil {
+			return 0, err
+		}
 	}
 	return w.ResponseWriter.WriteString(s)
 }
@@ -387,12 +399,29 @@ func (w *cachedWriter) Status() int {
 	return w.statusCode
 }
 
+func (w *cachedWriter) shouldBuffer(nextWriteSize int) bool {
+	if w.overflowed {
+		return false
+	}
+	if w.maxBodySize <= 0 {
+		return true
+	}
+	if int64(w.body.Len()+nextWriteSize) <= w.maxBodySize {
+		return true
+	}
+
+	// Stop buffering entirely once the response grows past the configured cache limit.
+	w.body.Reset()
+	w.overflowed = true
+	return false
+}
+
 // =========================================================================
 // 辅助方法
 // =========================================================================
 
 func (m *Middleware) executeHandler(c *gin.Context) *ResponseCache {
-	cw := getWriter(c.Writer)
+	cw := getWriter(c.Writer, m.cfg.maxBodySize)
 	defer putWriter(cw)
 
 	originalWriter := c.Writer
@@ -417,15 +446,23 @@ func (m *Middleware) executeHandler(c *gin.Context) *ResponseCache {
 	copy(body, cw.body.Bytes())
 
 	return &ResponseCache{
-		Status: cw.Status(),
-		Header: header,
-		Body:   body,
+		Status:   cw.Status(),
+		Header:   header,
+		Body:     body,
+		tooLarge: cw.overflowed,
 	}
 }
 
 func (m *Middleware) cacheResponse(key string, resp *ResponseCache, store persist.CacheStore, duration time.Duration) {
 	// 检查是否应该缓存
 	if !m.shouldCache(resp) {
+		return
+	}
+
+	if resp.tooLarge {
+		if m.cfg.logger != nil {
+			m.cfg.logger.Debugf("gincache: body exceeded max cache size, skip cache")
+		}
 		return
 	}
 

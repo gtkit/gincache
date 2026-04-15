@@ -182,3 +182,34 @@ func TestMiddlewareCacheableStatusOverride(t *testing.T) {
 		t.Fatalf("handler called %d times, want 1 for configured status caching", got)
 	}
 }
+
+func TestCachedWriterStopsBufferingAfterMaxBodySize(t *testing.T) {
+	t.Parallel()
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	cw := getWriter(ctx.Writer, 4)
+	t.Cleanup(func() {
+		putWriter(cw)
+	})
+
+	if _, err := cw.Write([]byte("ab")); err != nil {
+		t.Fatalf("first write error: %v", err)
+	}
+	if cw.overflowed {
+		t.Fatal("writer overflowed too early")
+	}
+	if got := cw.body.String(); got != "ab" {
+		t.Fatalf("buffer after first write = %q, want %q", got, "ab")
+	}
+
+	if _, err := cw.Write([]byte("cde")); err != nil {
+		t.Fatalf("second write error: %v", err)
+	}
+	if !cw.overflowed {
+		t.Fatal("writer should mark overflow after exceeding max body size")
+	}
+	if got := cw.body.Len(); got != 0 {
+		t.Fatalf("buffer length after overflow = %d, want 0", got)
+	}
+}

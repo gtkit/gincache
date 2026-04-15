@@ -3,13 +3,13 @@ package ristrettoadapter
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	ristretto "github.com/dgraph-io/ristretto/v2"
 	"github.com/gtkit/gincache/persist"
+	cachepattern "github.com/gtkit/gincache/persist/internal/pattern"
 )
 
 // CostFunc 用于把序列化后的值转换成 Ristretto 的成本值。
@@ -142,14 +142,18 @@ func (s *Store) Delete(key string) error {
 	return nil
 }
 
-// DeletePattern 按前缀模式删除 key。
+// DeletePattern 按模式删除 key。
 func (s *Store) DeletePattern(_ context.Context, pattern string) (int64, error) {
-	prefix := strings.TrimSuffix(pattern, "*")
+	matcher, err := cachepattern.Compile(pattern)
+	if err != nil {
+		return 0, err
+	}
+
 	var deleted int64
 
 	s.keys.Range(func(k, _ any) bool {
 		key := k.(string)
-		if strings.HasPrefix(key, prefix) {
+		if matcher.Match(key) {
 			s.cache.Del(key)
 			s.untrackKey(key)
 			deleted++

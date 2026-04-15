@@ -254,6 +254,8 @@ r.GET("/orders",
 ### `WithMaxBodySize`
 
 限制可缓存响应体大小。
+当响应体超过阈值时，中间件会停止继续缓冲该响应，并直接跳过缓存写入；
+客户端仍然会收到完整响应。
 
 ```go
 gincache.WithMaxBodySize(1 << 20) // 1MB
@@ -302,7 +304,7 @@ ctx := context.Background()
 // 删除单个 key
 _ = store.Delete("/products/100")
 
-// 按模式删除
+// 按模式删除（Redis glob）
 _, _ = store.DeletePattern(ctx, "/products:*")
 
 // 查询是否存在
@@ -314,6 +316,13 @@ ttl, _ := store.TTL(ctx, "/products/100")
 _ = ok
 _ = ttl
 ```
+
+说明：
+
+- `DeletePattern` 使用 Redis glob 风格匹配
+- `*` 表示任意长度
+- `?` 表示任意单个字符
+- 如果要匹配字面量 `?`，在 Go 字符串里请写成 `\\?`
 
 ## 2. MemoryStore
 
@@ -604,7 +613,7 @@ func invalidateProductDetail(ctx context.Context, store *persist.RedisStore, id 
 
 ```go
 func invalidateProductList(ctx context.Context, store *persist.RedisStore) error {
-	_, err := store.DeletePattern(ctx, "/api/v1/products*")
+	_, err := store.DeletePattern(ctx, "/api/v1/products\\?*")
 	return err
 }
 ```
@@ -629,6 +638,7 @@ func invalidateProductList(ctx context.Context, store *persist.RedisStore) error
 - 热点场景优先考虑 `TwoLevelStore`
 - L1 需要容量控制时，再显式接入 `Ristretto`
 - 响应体较大时一定设置 `WithMaxBodySize`
+  超过阈值后会停止继续缓冲并跳过缓存写入
 - key 一定加业务前缀
 
 不建议：

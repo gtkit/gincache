@@ -384,7 +384,7 @@ func (s *ProductService) Update(ctx context.Context, id int64, data map[string]a
 	}
 
 	// 3. 删除列表缓存（按模式）
-	if _, err := s.cache.DeletePattern(ctx, "/api/v1/products?*"); err != nil {
+	if _, err := s.cache.DeletePattern(ctx, "/api/v1/products\\?*"); err != nil {
 		log.Printf("Failed to delete pattern cache: %v", err)
 	}
 

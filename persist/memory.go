@@ -3,10 +3,11 @@ package persist
 import (
 	"context"
 	"encoding/json"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	cachepattern "github.com/gtkit/gincache/persist/internal/pattern"
 )
 
 // MemoryStore 内存缓存存储（生产级实现）
@@ -118,21 +119,18 @@ func (s *MemoryStore) Delete(key string) error {
 	return nil
 }
 
-// DeletePattern 按模式删除缓存（简单前缀匹配）
+// DeletePattern 按模式删除缓存（支持 Redis 风格通配符）。
 func (s *MemoryStore) DeletePattern(_ context.Context, pattern string) (int64, error) {
-	// 简单实现：遍历所有 key，匹配前缀
-	// 生产环境如果 key 很多，建议使用 Redis
-	var deleted int64
-
-	// 移除通配符
-	prefix := pattern
-	if len(prefix) > 0 && prefix[len(prefix)-1] == '*' {
-		prefix = prefix[:len(prefix)-1]
+	matcher, err := cachepattern.Compile(pattern)
+	if err != nil {
+		return 0, err
 	}
+
+	var deleted int64
 
 	s.data.Range(func(k, _ any) bool {
 		key := k.(string)
-		if strings.HasPrefix(key, prefix) {
+		if matcher.Match(key) {
 			s.data.Delete(key)
 			deleted++
 		}
