@@ -23,9 +23,12 @@ import (
 
 // ResponseCache 缓存的响应数据.
 type ResponseCache struct {
-	Status int               `json:"s"`
+	Status int `json:"s"`
+	// Header 保留旧的单值 header 视图，用于兼容历史数据和现有调用方。
 	Header map[string]string `json:"h"`
-	Body   []byte            `json:"b"`
+	// Headers 保存完整的 header 集合，缓存命中时优先用它回放响应。
+	Headers http.Header `json:"hv,omitempty"`
+	Body    []byte      `json:"b"`
 
 	tooLarge bool `json:"-"`
 }
@@ -433,13 +436,7 @@ func (m *Middleware) executeHandler(c *gin.Context) *ResponseCache {
 	// 恢复原始 Writer
 	c.Writer = originalWriter
 
-	// 收集响应头（只保留需要的）
-	header := make(map[string]string)
-	for _, key := range []string{"Content-Type", "Content-Encoding", "Cache-Control", "ETag", "Last-Modified"} {
-		if v := cw.Header().Get(key); v != "" {
-			header[key] = v
-		}
-	}
+	headers := cloneCachedHeaders(cw.Header())
 
 	// 复制 Body（重要：必须复制，因为 buffer 会被重用）
 	body := make([]byte, cw.body.Len())
@@ -447,7 +444,8 @@ func (m *Middleware) executeHandler(c *gin.Context) *ResponseCache {
 
 	return &ResponseCache{
 		Status:   cw.Status(),
-		Header:   header,
+		Header:   flattenLegacyHeaders(headers),
+		Headers:  headers,
 		Body:     body,
 		tooLarge: cw.overflowed,
 	}
@@ -495,21 +493,55 @@ func (m *Middleware) shouldCache(resp *ResponseCache) bool {
 }
 
 func (m *Middleware) writeResponse(c *gin.Context, resp *ResponseCache) {
-	// 设置响应头
-	for k, v := range resp.Header {
-		if k == "Content-Type" {
-			continue
-		}
-		c.Header(k, v)
-	}
+	applyCachedHeaders(c.Writer.Header(), resp)
 	c.Header("X-Cache", "HIT")
 
-	// 写入响应
-	contentType := resp.Header["Content-Type"]
-	if contentType == "" {
-		contentType = "application/json; charset=utf-8"
+	c.Status(resp.Status)
+	if c.Request.Method == http.MethodHead || len(resp.Body) == 0 {
+		c.Writer.WriteHeaderNow()
+		return
 	}
-	c.Data(resp.Status, contentType, resp.Body)
+	_, _ = c.Writer.Write(resp.Body)
+}
+
+func cloneCachedHeaders(src http.Header) http.Header {
+	if len(src) == 0 {
+		return nil
+	}
+
+	cloned := src.Clone()
+	delete(cloned, "X-Cache")
+	return cloned
+}
+
+func flattenLegacyHeaders(src http.Header) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+
+	flat := make(map[string]string, len(src))
+	for key, values := range src {
+		if len(values) == 0 {
+			flat[key] = ""
+			continue
+		}
+		flat[key] = values[0]
+	}
+	return flat
+}
+
+func applyCachedHeaders(dst http.Header, resp *ResponseCache) {
+	if len(resp.Headers) > 0 {
+		for key, values := range resp.Headers {
+			copied := append([]string(nil), values...)
+			dst[key] = copied
+		}
+		return
+	}
+
+	for key, value := range resp.Header {
+		dst.Set(key, value)
+	}
 }
 
 // =========================================================================

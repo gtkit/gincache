@@ -54,6 +54,9 @@ func NewMemoryStore(defaultExpiration time.Duration, opts ...MemoryStoreOption) 
 	for _, opt := range opts {
 		opt(s)
 	}
+	if s.cleanupInterval <= 0 {
+		s.cleanupInterval = time.Minute
+	}
 
 	// 启动后台清理协程
 	go s.cleanupLoop()

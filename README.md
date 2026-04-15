@@ -35,6 +35,7 @@
 - 支持自定义可缓存状态码
 - 内置 `singleflight` 防击穿
 - 支持响应体大小限制
+- 缓存命中时保留原始响应头（含多值 header）
 - 支持本地缓存 + Redis 的两级缓存
 - 支持通过 `LocalStore` 接口扩展任意 L1 本地缓存
 
@@ -340,6 +341,7 @@ defer store.Close()
 ```
 
 注意：`MemoryStore` 没有容量上限，不适合高基数、内存敏感场景。
+如果 `WithCleanupInterval` 传入 `<= 0`，会自动回退到默认的 `1m`。
 
 ## 3. TwoLevelStore
 
@@ -532,6 +534,12 @@ store := persist.NewTwoLevelStore(redisClient,
 - 你希望测试行为更稳定
 - 你希望本地写入后尽快可见
 - 你更重视可见性而不是极限吞吐
+
+补充：
+
+- 如果你是把“外部创建好的 `Ristretto` 实例”交给 `ristrettoadapter.New(...)`
+- 适配器内部维护的 tracked key 统计会基于当前缓存状态做惰性清理
+- 如果你希望写入后的 tracked 状态更快收敛，建议配合 `WithWait()`
 
 ## 完整示例
 

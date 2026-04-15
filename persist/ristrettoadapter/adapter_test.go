@@ -184,9 +184,8 @@ func TestGetMissDoesNotUntrackKey(t *testing.T) {
 	store := New(cache)
 	store.trackKey("user:pending")
 
-	stats := store.Stats()
-	if stats["tracked"] != 1 {
-		t.Fatalf("tracked before miss = %d, want 1", stats["tracked"])
+	if got := store.keyCount.Load(); got != 1 {
+		t.Fatalf("tracked before miss = %d, want 1", got)
 	}
 
 	var got map[string]any
@@ -194,8 +193,42 @@ func TestGetMissDoesNotUntrackKey(t *testing.T) {
 		t.Fatalf("Get err = %v, want %v", err, persist.ErrCacheMiss)
 	}
 
-	stats = store.Stats()
-	if stats["tracked"] != 1 {
-		t.Fatalf("tracked after miss = %d, want 1", stats["tracked"])
+	if got := store.keyCount.Load(); got != 1 {
+		t.Fatalf("tracked after miss = %d, want 1", got)
+	}
+}
+
+func TestStatsPrunesTrackedKeysEvictedFromCache(t *testing.T) {
+	t.Parallel()
+
+	cache, err := ristretto.NewCache(&ristretto.Config[string, []byte]{
+		NumCounters:        1_000,
+		MaxCost:            1,
+		BufferItems:        64,
+		IgnoreInternalCost: true,
+	})
+	if err != nil {
+		t.Fatalf("NewCache error: %v", err)
+	}
+
+	store := New(cache, WithWait())
+
+	keys := []string{"user:1", "user:2", "user:3"}
+	for _, key := range keys {
+		if err := store.Set(key, map[string]any{"key": key}, time.Minute); err != nil {
+			t.Fatalf("Set(%s) error: %v", key, err)
+		}
+	}
+
+	var live int64
+	for _, key := range keys {
+		if _, ok := cache.Get(key); ok {
+			live++
+		}
+	}
+
+	stats := store.Stats()
+	if stats["tracked"] != live {
+		t.Fatalf("tracked after eviction = %d, want %d live keys", stats["tracked"], live)
 	}
 }

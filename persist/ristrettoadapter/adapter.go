@@ -31,7 +31,11 @@ type Store struct {
 	setCount    atomic.Uint64
 	delCount    atomic.Uint64
 	rejectCount atomic.Uint64
+	mutations   atomic.Uint64
+	pruning     atomic.Bool
 }
+
+const trackedKeyPruneEvery = 256
 
 // Option 用于配置 Store 包装层行为。
 type Option func(*Store)
@@ -65,6 +69,7 @@ func WithOwnedCache() Option {
 }
 
 // New 把一个现有的 Ristretto 实例包装为 persist.LocalStore。
+// 对外部注入的 cache，tracked key 会在 Stats/DeletePattern 和周期性清理时做惰性收敛。
 func New(cache *ristretto.Cache[string, []byte], opts ...Option) *Store {
 	store := &Store{
 		cache:  cache,
@@ -128,8 +133,14 @@ func (s *Store) SetWithContext(_ context.Context, key string, value any, expire 
 		return nil
 	}
 
-	s.trackKey(key)
 	s.wait()
+	if s.waitOnMutation {
+		s.syncTrackedKey(key)
+		return nil
+	}
+
+	s.trackKey(key)
+	s.maybePruneTrackedKeys()
 	return nil
 }
 
@@ -139,6 +150,7 @@ func (s *Store) Delete(key string) error {
 	s.untrackKey(key)
 	s.delCount.Add(1)
 	s.wait()
+	s.maybePruneTrackedKeys()
 	return nil
 }
 
@@ -148,6 +160,8 @@ func (s *Store) DeletePattern(_ context.Context, pattern string) (int64, error) 
 	if err != nil {
 		return 0, err
 	}
+
+	s.pruneTrackedKeys()
 
 	var deleted int64
 
@@ -176,6 +190,8 @@ func (s *Store) Close() error {
 
 // Stats 返回包装层维护的统计信息。
 func (s *Store) Stats() map[string]int64 {
+	s.pruneTrackedKeys()
+
 	hit := s.hitCount.Load()
 	miss := s.missCount.Load()
 	total := hit + miss
@@ -219,6 +235,42 @@ func (s *Store) untrackKey(key string) {
 	if _, loaded := s.keys.LoadAndDelete(key); loaded {
 		s.keyCount.Add(-1)
 	}
+}
+
+func (s *Store) syncTrackedKey(key string) {
+	if _, ok := s.cache.Get(key); ok {
+		s.trackKey(key)
+		return
+	}
+	s.untrackKey(key)
+}
+
+func (s *Store) maybePruneTrackedKeys() {
+	if s.keyCount.Load() == 0 {
+		return
+	}
+	if s.mutations.Add(1)%trackedKeyPruneEvery != 0 {
+		return
+	}
+	s.pruneTrackedKeys()
+}
+
+func (s *Store) pruneTrackedKeys() {
+	if s.keyCount.Load() == 0 {
+		return
+	}
+	if !s.pruning.CompareAndSwap(false, true) {
+		return
+	}
+	defer s.pruning.Store(false)
+
+	s.keys.Range(func(k, _ any) bool {
+		key := k.(string)
+		if _, ok := s.cache.Get(key); !ok {
+			s.untrackKey(key)
+		}
+		return true
+	})
 }
 
 func (s *Store) wait() {

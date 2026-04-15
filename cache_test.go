@@ -119,6 +119,45 @@ func TestMiddlewareCacheReplay(t *testing.T) {
 	}
 }
 
+func TestMiddlewareCacheReplayPreservesFullHeaders(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+
+	store := persist.NewMemoryStore(time.Minute)
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
+
+	router := gin.New()
+	router.GET("/headers",
+		CacheByRequestPath(store, time.Minute),
+		func(c *gin.Context) {
+			c.Header("Vary", "Accept-Encoding")
+			c.Header("X-Trace", "trace-1")
+			c.Writer.Header().Add("Link", `</a.css>; rel=preload; as=style`)
+			c.Writer.Header().Add("Link", `</b.js>; rel=preload; as=script`)
+			c.Data(http.StatusOK, "application/json; charset=utf-8", []byte(`{"ok":true}`))
+		},
+	)
+
+	first := httptest.NewRecorder()
+	router.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/headers", nil))
+
+	second := httptest.NewRecorder()
+	router.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/headers", nil))
+
+	if got := second.Header().Get("Vary"); got != "Accept-Encoding" {
+		t.Fatalf("cached Vary = %q, want %q", got, "Accept-Encoding")
+	}
+	if got := second.Header().Get("X-Trace"); got != "trace-1" {
+		t.Fatalf("cached X-Trace = %q, want %q", got, "trace-1")
+	}
+	if got := second.Header().Values("Link"); len(got) != 2 || got[0] != `</a.css>; rel=preload; as=style` || got[1] != `</b.js>; rel=preload; as=script` {
+		t.Fatalf("cached Link = %#v, want both values preserved", got)
+	}
+}
+
 func TestMiddlewareCacheableStatusDefaults(t *testing.T) {
 	t.Parallel()
 
