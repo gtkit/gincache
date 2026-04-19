@@ -2,7 +2,6 @@ package ristrettoadapter
 
 import (
 	"context"
-	"encoding/json"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -10,6 +9,7 @@ import (
 	ristretto "github.com/dgraph-io/ristretto/v2"
 	"github.com/gtkit/gincache/persist"
 	cachepattern "github.com/gtkit/gincache/persist/internal/pattern"
+	"github.com/gtkit/json"
 )
 
 // CostFunc 用于把序列化后的值转换成 Ristretto 的成本值。

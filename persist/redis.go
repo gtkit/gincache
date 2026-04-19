@@ -2,10 +2,10 @@ package persist
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"time"
 
+	"github.com/gtkit/json"
 	"github.com/redis/go-redis/v9"
 )
 

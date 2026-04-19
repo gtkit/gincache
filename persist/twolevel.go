@@ -2,11 +2,11 @@ package persist
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sync/atomic"
 	"time"
 
+	"github.com/gtkit/json"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"
 )

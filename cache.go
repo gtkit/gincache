@@ -4,7 +4,6 @@ package gincache
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"net/http"
 	"slices"
 	"strings"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gtkit/gincache/persist"
+	"github.com/gtkit/json"
 	"golang.org/x/sync/singleflight"
 )
 

@@ -2,12 +2,12 @@ package persist
 
 import (
 	"context"
-	"encoding/json"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	cachepattern "github.com/gtkit/gincache/persist/internal/pattern"
+	"github.com/gtkit/json"
 )
 
 // MemoryStore 内存缓存存储（生产级实现）
