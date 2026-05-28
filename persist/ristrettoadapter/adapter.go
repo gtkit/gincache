@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	ristretto "github.com/dgraph-io/ristretto/v2"
+	"github.com/dgraph-io/ristretto/v2"
 	"github.com/gtkit/gincache/persist"
 	cachepattern "github.com/gtkit/gincache/persist/internal/pattern"
 	"github.com/gtkit/json"

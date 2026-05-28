@@ -3,6 +3,7 @@ package persist
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 // TwoLevelStore 是一个面向生产的两级缓存实现。
 // L1 是可插拔的本地缓存，默认使用 MemoryStore。
 // L2 是 Redis，并作为共享缓存的事实来源。
+// 并发安全性取决于注入的 LocalStore；默认 MemoryStore 和 Redis L2 可并发使用。
 type TwoLevelStore struct {
 	local     LocalStore
 	remote    *RedisStore
@@ -22,6 +24,12 @@ type TwoLevelStore struct {
 	sf        singleflight.Group
 	keyPrefix string
 
+	sfForgetTimeout     time.Duration
+	invalidation        *twoLevelInvalidation
+	invalidationClient  redis.UniversalClient
+	invalidationTimeout time.Duration
+	logger              TwoLevelLogger
+
 	localHit  atomic.Uint64
 	remoteHit atomic.Uint64
 	miss      atomic.Uint64
@@ -29,6 +37,11 @@ type TwoLevelStore struct {
 
 // TwoLevelStoreOption 用于配置 TwoLevelStore。
 type TwoLevelStoreOption func(*TwoLevelStore)
+
+// TwoLevelLogger 是 TwoLevelStore 用于记录后台失效广播错误的最小日志接口。
+type TwoLevelLogger interface {
+	Errorf(format string, args ...any)
+}
 
 // WithLocalTTL 设置本地缓存默认 TTL。
 func WithLocalTTL(ttl time.Duration) TwoLevelStoreOption {
@@ -52,18 +65,57 @@ func WithTwoLevelKeyPrefix(prefix string) TwoLevelStoreOption {
 }
 
 // WithLocalStore 注入自定义本地缓存实现。
+// 自定义实现需要自行保证可被多个 goroutine 并发调用。
 func WithLocalStore(local LocalStore) TwoLevelStoreOption {
 	return func(s *TwoLevelStore) {
 		s.local = local
 	}
 }
 
+// WithTwoLevelSingleFlightForgetTimeout 设置 TwoLevelStore 内部 singleflight 的释放时间。
+// 超时后会调用 Forget，允许后续同 key 请求重新成为 leader，避免长尾回源阻塞所有等待者。
+func WithTwoLevelSingleFlightForgetTimeout(timeout time.Duration) TwoLevelStoreOption {
+	return func(s *TwoLevelStore) {
+		s.sfForgetTimeout = timeout
+	}
+}
+
+// WithTwoLevelLogger 设置 TwoLevelStore 后台路径使用的错误日志接口。
+func WithTwoLevelLogger(logger TwoLevelLogger) TwoLevelStoreOption {
+	return func(s *TwoLevelStore) {
+		s.logger = logger
+	}
+}
+
+// WithTwoLevelInvalidationTimeout 设置 L1 失效广播订阅启动确认超时。
+func WithTwoLevelInvalidationTimeout(timeout time.Duration) TwoLevelStoreOption {
+	return func(s *TwoLevelStore) {
+		if timeout > 0 {
+			s.invalidationTimeout = timeout
+		}
+	}
+}
+
+// WithTwoLevelInvalidationBroadcast 开启基于 Redis Pub/Sub 的 L1 失效广播。
+// Set/Delete/DeletePattern 成功后会发布失效消息，其他实例收到后清理自己的本地缓存。
+func WithTwoLevelInvalidationBroadcast(client redis.UniversalClient, channel string) TwoLevelStoreOption {
+	return func(s *TwoLevelStore) {
+		if client == nil || channel == "" {
+			return
+		}
+		s.invalidationClient = client
+		s.invalidation = &twoLevelInvalidation{channel: channel}
+	}
+}
+
 // NewTwoLevelStore 创建一个 L1 可插拔、L2 为 Redis 的两级缓存。
 func NewTwoLevelStore(redisClient redis.Cmdable, opts ...TwoLevelStoreOption) *TwoLevelStore {
 	s := &TwoLevelStore{
-		localTTL:  30 * time.Second,
-		remoteTTL: 5 * time.Minute,
-		keyPrefix: "gincache:2l:",
+		localTTL:            30 * time.Second,
+		remoteTTL:           5 * time.Minute,
+		keyPrefix:           "gincache:2l:",
+		sfForgetTimeout:     10 * time.Second,
+		invalidationTimeout: 5 * time.Second,
 	}
 
 	for _, opt := range opts {
@@ -76,6 +128,7 @@ func NewTwoLevelStore(redisClient redis.Cmdable, opts ...TwoLevelStoreOption) *T
 	}
 
 	s.remote = NewRedisStore(redisClient, WithKeyPrefix(s.keyPrefix))
+	s.startInvalidation()
 	return s
 }
 
@@ -87,6 +140,9 @@ func (s *TwoLevelStore) Get(key string, value any) error {
 	}
 
 	result, err, _ := s.sf.Do(key, func() (any, error) {
+		stopForget := s.scheduleSingleFlightForget(key)
+		defer stopForget()
+
 		var temp json.RawMessage
 		if err := s.local.Get(key, &temp); err == nil {
 			return temp, nil
@@ -142,13 +198,23 @@ func (s *TwoLevelStore) SetWithContext(ctx context.Context, key string, value an
 		return err
 	}
 
-	return s.local.Set(key, value, localExpire)
+	s.publishInvalidation(ctx, twoLevelInvalidationKey, key)
+
+	if err := s.local.Set(key, value, localExpire); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // Delete 同时删除本地缓存和 Redis 中的单个 key。
 func (s *TwoLevelStore) Delete(key string) error {
 	_ = s.local.Delete(key)
-	return s.remote.Delete(key)
+	err := s.remote.Delete(key)
+	if err == nil {
+		s.publishInvalidation(context.Background(), twoLevelInvalidationKey, key)
+	}
+	return err
 }
 
 // DeletePattern 先尽力删除本地缓存，再删除 Redis 中匹配模式的 key。
@@ -156,7 +222,11 @@ func (s *TwoLevelStore) DeletePattern(ctx context.Context, pattern string) (int6
 	if local, ok := s.local.(LocalStoreWithPattern); ok {
 		_, _ = local.DeletePattern(ctx, pattern)
 	}
-	return s.remote.DeletePattern(ctx, pattern)
+	n, err := s.remote.DeletePattern(ctx, pattern)
+	if err == nil {
+		s.publishInvalidation(ctx, twoLevelInvalidationPattern, pattern)
+	}
+	return n, err
 }
 
 // InvalidateLocal 只删除本地缓存中的单个 key。
@@ -210,6 +280,7 @@ func (s *TwoLevelStore) ResetStats() {
 
 // Close 关闭本地缓存。
 func (s *TwoLevelStore) Close() error {
+	s.closeInvalidation()
 	return s.local.Close()
 }
 
@@ -221,4 +292,145 @@ func (s *TwoLevelStore) LocalStore() LocalStore {
 // RemoteStore 返回 Redis 实现的二级缓存。
 func (s *TwoLevelStore) RemoteStore() *RedisStore {
 	return s.remote
+}
+
+func (s *TwoLevelStore) scheduleSingleFlightForget(key string) func() {
+	if s.sfForgetTimeout <= 0 {
+		return func() {}
+	}
+
+	timer := time.AfterFunc(s.sfForgetTimeout, func() {
+		s.sf.Forget(key)
+	})
+	return func() {
+		timer.Stop()
+	}
+}
+
+const (
+	twoLevelInvalidationKey     = "key"
+	twoLevelInvalidationPattern = "pattern"
+
+	defaultTwoLevelInvalidationChannelSize = 32
+)
+
+type twoLevelInvalidationMessage struct {
+	Origin string `json:"origin"`
+	Type   string `json:"type"`
+	Value  string `json:"value"`
+}
+
+type twoLevelInvalidation struct {
+	channel string
+	origin  string
+
+	pubsub *redis.PubSub
+	done   chan struct{}
+	once   sync.Once
+	closed atomic.Bool
+}
+
+func (s *TwoLevelStore) startInvalidation() {
+	if s.invalidation == nil || s.invalidation.channel == "" {
+		return
+	}
+	if s.invalidationClient == nil {
+		s.invalidation = nil
+		return
+	}
+
+	s.invalidation.origin = fmt.Sprintf("%p", s)
+	s.invalidation.done = make(chan struct{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), s.invalidationTimeout)
+	defer cancel()
+
+	pubsub := s.invalidationClient.Subscribe(ctx, s.invalidation.channel)
+	if _, err := pubsub.Receive(ctx); err != nil {
+		_ = pubsub.Close()
+		s.logf("gincache: failed to start invalidation subscriber channel=%q: %v", s.invalidation.channel, err)
+		s.invalidation = nil
+		return
+	}
+
+	s.invalidation.pubsub = pubsub
+
+	go s.listenInvalidations()
+}
+
+func (s *TwoLevelStore) listenInvalidations() {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.logf("gincache: invalidation subscriber panic channel=%q: %v", s.invalidation.channel, recovered)
+		}
+		close(s.invalidation.done)
+	}()
+
+	ch := s.invalidation.pubsub.Channel(redis.WithChannelSize(defaultTwoLevelInvalidationChannelSize))
+	for msg := range ch {
+		var event twoLevelInvalidationMessage
+		if err := json.Unmarshal([]byte(msg.Payload), &event); err != nil {
+			s.logf("gincache: invalid invalidation message channel=%q: %v", s.invalidation.channel, err)
+			continue
+		}
+		if event.Origin == s.invalidation.origin {
+			continue
+		}
+
+		switch event.Type {
+		case twoLevelInvalidationKey:
+			if err := s.local.Delete(event.Value); err != nil {
+				s.logf("gincache: failed to delete local key from invalidation key=%q: %v", event.Value, err)
+			}
+			s.sf.Forget(event.Value)
+		case twoLevelInvalidationPattern:
+			if local, ok := s.local.(LocalStoreWithPattern); ok {
+				if _, err := local.DeletePattern(context.Background(), event.Value); err != nil {
+					s.logf("gincache: failed to delete local pattern from invalidation pattern=%q: %v", event.Value, err)
+				}
+			}
+		default:
+			s.logf("gincache: unknown invalidation message type=%q channel=%q", event.Type, s.invalidation.channel)
+		}
+	}
+	if !s.invalidation.closed.Load() {
+		s.logf("gincache: invalidation subscriber channel closed channel=%q", s.invalidation.channel)
+	}
+}
+
+func (s *TwoLevelStore) publishInvalidation(ctx context.Context, typ, value string) {
+	if s.invalidation == nil || s.invalidationClient == nil {
+		return
+	}
+
+	payload, err := json.Marshal(twoLevelInvalidationMessage{
+		Origin: s.invalidation.origin,
+		Type:   typ,
+		Value:  value,
+	})
+	if err != nil {
+		return
+	}
+
+	if err := s.invalidationClient.Publish(ctx, s.invalidation.channel, payload).Err(); err != nil {
+		s.logf("gincache: failed to publish invalidation channel=%q type=%q value=%q: %v", s.invalidation.channel, typ, value, err)
+	}
+}
+
+func (s *TwoLevelStore) closeInvalidation() {
+	if s.invalidation == nil || s.invalidation.pubsub == nil {
+		return
+	}
+
+	s.invalidation.once.Do(func() {
+		s.invalidation.closed.Store(true)
+		_ = s.invalidation.pubsub.Close()
+		<-s.invalidation.done
+	})
+}
+
+func (s *TwoLevelStore) logf(format string, args ...any) {
+	if s.logger != nil {
+		s.logger.Errorf(format, args...)
+	}
 }

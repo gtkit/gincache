@@ -376,6 +376,48 @@ store := persist.NewTwoLevelStore(redisClient,
 defer store.Close()
 ```
 
+### 多实例 L1 失效广播
+
+对路由响应缓存这类数据，`TwoLevelStore` 可以开启 Redis Pub/Sub 广播：
+
+```go
+store := persist.NewTwoLevelStore(redisClient,
+	persist.WithLocalTTL(30*time.Second),
+	persist.WithRemoteTTL(5*time.Minute),
+	persist.WithTwoLevelKeyPrefix("myapp:hot:"),
+	persist.WithTwoLevelInvalidationBroadcast(redisClient, "myapp:gincache:l1:invalidate"),
+	persist.WithTwoLevelInvalidationTimeout(5*time.Second),
+)
+defer func() {
+	if err := store.Close(); err != nil {
+		log.Printf("close cache store failed: %v", err)
+	}
+}()
+```
+
+开启后，`Set`、`Delete`、`DeletePattern` 成功时会发布 L1 失效消息。其他实例收到消息后会清理自己的本地缓存，下一次请求会从 Redis 重新读取并回填 L1。广播客户端必须是 `redis.UniversalClient`，这样 `Publish` 和 `Subscribe` 能力在编译期明确；普通 `redis.Cmdable` 仍可用于不开启广播的 `TwoLevelStore`。
+
+这带来的主要效果是：多实例部署下，订单状态、价格、库存、后台配置等敏感路由缓存被更新或删除后，不再依赖默认 `30s` 本地 TTL 自然过期，通常可以在亚秒级收敛。它不会让缓存命中率变高，也不提供强一致保证；Redis Pub/Sub 断线期间的消息仍可能丢失，因此业务仍应把 Redis 作为 L2 事实来源。
+
+建议配置日志以便排查广播链路问题：
+
+```go
+store := persist.NewTwoLevelStore(redisClient,
+	persist.WithTwoLevelLogger(logger),
+	persist.WithTwoLevelInvalidationBroadcast(redisClient, "myapp:gincache:l1:invalidate"),
+)
+```
+
+`WithTwoLevelLogger` 会记录订阅启动失败、订阅异常关闭、消息解析失败、本地失效失败和发布失败。发布是同步执行的，能减少失效消息排队的不确定性，但会把 Redis Publish 的耗时计入 `Set` / `Delete` / `DeletePattern` 调用延迟。
+
+如果某个 key 回源 Redis 时间过长，内部 singleflight 默认会在 `10s` 后 `Forget`，允许后续同 key 请求重新成为 leader。可以按业务延迟调整：
+
+```go
+store := persist.NewTwoLevelStore(redisClient,
+	persist.WithTwoLevelSingleFlightForgetTimeout(3*time.Second),
+)
+```
+
 ### 自定义注入本地缓存
 
 主模块保留了 `LocalStore` 扩展点。
@@ -388,6 +430,105 @@ store := persist.NewTwoLevelStore(redisClient,
 	persist.WithRemoteTTL(5*time.Minute),
 )
 ```
+
+### 接入其他本地缓存库
+
+如果你想接入 `BigCache`、`FreeCache` 或其他本地缓存库，不需要改 `gincache` 主模块。调用方只要在自己的项目里实现 `persist.LocalStore`，再通过 `persist.WithLocalStore(...)` 注入 `TwoLevelStore` 即可。
+
+`LocalStore` 的契约是：
+
+```go
+type LocalStore interface {
+	Get(key string, value any) error
+	Set(key string, value any, expire time.Duration) error
+	Delete(key string) error
+	Close() error
+	Stats() map[string]int64
+	ResetStats()
+}
+```
+
+下面是一个 `BigCache` 适配器骨架，适合放在你的业务项目或独立扩展包里：
+
+```go
+package localcache
+
+import (
+	"errors"
+	"time"
+
+	"github.com/allegro/bigcache/v3"
+	"github.com/gtkit/gincache/persist"
+	"github.com/gtkit/json"
+)
+
+type BigCacheStore struct {
+	cache *bigcache.BigCache
+}
+
+func NewBigCacheStore(cache *bigcache.BigCache) *BigCacheStore {
+	return &BigCacheStore{cache: cache}
+}
+
+func (s *BigCacheStore) Get(key string, value any) error {
+	data, err := s.cache.Get(key)
+	if err != nil {
+		if errors.Is(err, bigcache.ErrEntryNotFound) {
+			return persist.ErrCacheMiss
+		}
+		return err
+	}
+	return json.Unmarshal(data, value)
+}
+
+func (s *BigCacheStore) Set(key string, value any, _ time.Duration) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return s.cache.Set(key, data)
+}
+
+func (s *BigCacheStore) Delete(key string) error {
+	return s.cache.Delete(key)
+}
+
+func (s *BigCacheStore) Close() error {
+	return s.cache.Close()
+}
+
+func (s *BigCacheStore) Stats() map[string]int64 {
+	return map[string]int64{"keys": int64(s.cache.Len())}
+}
+
+func (s *BigCacheStore) ResetStats() {}
+```
+
+使用时：
+
+```go
+cfg := bigcache.DefaultConfig(30 * time.Second)
+cache, err := bigcache.New(context.Background(), cfg)
+if err != nil {
+	return err
+}
+
+store := persist.NewTwoLevelStore(redisClient,
+	persist.WithLocalStore(localcache.NewBigCacheStore(cache)),
+	persist.WithRemoteTTL(5*time.Minute),
+)
+defer func() {
+	if err := store.Close(); err != nil {
+		log.Printf("close cache store failed: %v", err)
+	}
+}()
+```
+
+注意：
+
+- 上面示例里的 `expire` 参数没有单独传给 BigCache；BigCache 常见用法是通过 `DefaultConfig` 设置全局淘汰周期。
+- 如果你需要每个 key 独立 TTL，可以在 adapter 写入的 value 里额外封装过期时间，并在 `Get` 时自行判断。
+- 如果本地缓存库不支持按模式删除，`DeletePattern` 只会清理 Redis；本地 L1 依赖 TTL 或失效广播继续收敛。
 
 ### 查看统计
 
@@ -630,6 +771,7 @@ func invalidateProductList(ctx context.Context, store *persist.RedisStore) error
 
 - Redis 删除负责全局共享缓存失效
 - 本地缓存删除负责当前实例 L1 失效
+- 开启 `WithTwoLevelInvalidationBroadcast` 后，其他实例的 L1 也会收到广播并清理
 
 当前主模块已经支持：
 
@@ -637,6 +779,10 @@ func invalidateProductList(ctx context.Context, store *persist.RedisStore) error
 - `DeletePattern(pattern)`
 - `InvalidateLocal(key)`
 - `InvalidateLocalPattern(pattern)`
+- `WithTwoLevelInvalidationBroadcast(client, channel)`
+- `WithTwoLevelInvalidationTimeout(timeout)`
+- `WithTwoLevelLogger(logger)`
+- `WithTwoLevelSingleFlightForgetTimeout(timeout)`
 
 ## 生产建议
 
@@ -685,7 +831,7 @@ go test ./...
 仍需注意：
 
 - 本地缓存仍是单实例语义
-- 跨实例 L1 失效广播还没有做
+- 跨实例 L1 失效广播依赖 Redis Pub/Sub，断线期间的消息不保证补发
 - `go test -race ./...` 依赖本机有可用 C 编译器
 
 ## License

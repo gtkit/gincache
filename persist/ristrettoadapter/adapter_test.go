@@ -232,3 +232,60 @@ func TestStatsPrunesTrackedKeysEvictedFromCache(t *testing.T) {
 		t.Fatalf("tracked after eviction = %d, want %d live keys", stats["tracked"], live)
 	}
 }
+
+func TestOptionsDeleteCloseAndResetStats(t *testing.T) {
+	t.Parallel()
+
+	cache, err := ristretto.NewCache(&ristretto.Config[string, []byte]{
+		NumCounters: 1_000,
+		MaxCost:     1 << 20,
+		BufferItems: 64,
+	})
+	if err != nil {
+		t.Fatalf("NewCache error: %v", err)
+	}
+
+	var costs []int64
+	store := New(cache,
+		WithDefaultExpiration(time.Minute),
+		WithCost(func(_ string, value []byte) int64 {
+			cost := int64(len(value))
+			costs = append(costs, cost)
+			return cost
+		}),
+		WithWait(),
+		WithOwnedCache(),
+	)
+
+	if err := store.Set("user:1", map[string]any{"name": "alice"}, 0); err != nil {
+		t.Fatalf("Set error: %v", err)
+	}
+	if len(costs) != 1 || costs[0] <= 0 {
+		t.Fatalf("costs = %#v, want one positive cost", costs)
+	}
+
+	var got map[string]any
+	if err := store.Get("user:1", &got); err != nil {
+		t.Fatalf("Get error: %v", err)
+	}
+	if err := store.Delete("user:1"); err != nil {
+		t.Fatalf("Delete error: %v", err)
+	}
+	if err := store.Get("user:1", &got); !errors.Is(err, persist.ErrCacheMiss) {
+		t.Fatalf("Get deleted key error = %v, want %v", err, persist.ErrCacheMiss)
+	}
+
+	stats := store.Stats()
+	if stats["hit"] == 0 || stats["miss"] == 0 || stats["set"] == 0 || stats["del"] == 0 {
+		t.Fatalf("stats before reset = %#v, want non-zero counters", stats)
+	}
+	store.ResetStats()
+	stats = store.Stats()
+	if stats["hit"] != 0 || stats["miss"] != 0 || stats["set"] != 0 || stats["del"] != 0 {
+		t.Fatalf("stats after reset = %#v, want zero counters", stats)
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+}

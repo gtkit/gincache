@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -208,7 +209,7 @@ func TestMiddlewareCacheableStatusOverride(t *testing.T) {
 			n := calls.Add(1)
 			c.Status(http.StatusNotModified)
 			c.Header("ETag", "etag-2")
-			_, _ = c.Writer.Write([]byte(fmt.Sprintf(`{"call":%d}`, n)))
+			_, _ = fmt.Fprintf(c.Writer, `{"call":%d}`, n)
 		},
 	)
 
@@ -251,4 +252,302 @@ func TestCachedWriterStopsBufferingAfterMaxBodySize(t *testing.T) {
 	if got := cw.body.Len(); got != 0 {
 		t.Fatalf("buffer length after overflow = %d, want 0", got)
 	}
+}
+
+func TestMiddlewareDynamicStrategyAndCallbacks(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+
+	store := persist.NewMemoryStore(time.Minute)
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
+
+	otherStore := persist.NewMemoryStore(time.Minute)
+	t.Cleanup(func() {
+		_ = otherStore.Close()
+	})
+
+	var hits, misses atomic.Int32
+	middleware := New(store, time.Minute,
+		WithCacheStrategyByRequest(func(c *gin.Context) (bool, Strategy) {
+			if c.Query("skip") == "1" {
+				return false, Strategy{}
+			}
+			return true, Strategy{
+				CacheKey:      "dynamic:" + c.Query("id"),
+				CacheStore:    otherStore,
+				CacheDuration: 30 * time.Second,
+			}
+		}),
+		WithOnHitCache(func(*gin.Context) {
+			hits.Add(1)
+		}),
+		WithOnMissCache(func(*gin.Context) {
+			misses.Add(1)
+		}),
+	)
+
+	var calls atomic.Int32
+	router := gin.New()
+	router.GET("/dynamic", middleware.Handler(), func(c *gin.Context) {
+		n := calls.Add(1)
+		c.JSON(http.StatusOK, gin.H{"call": n})
+	})
+
+	for range 2 {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dynamic?id=42", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("dynamic status = %d, want %d", rec.Code, http.StatusOK)
+		}
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("handler calls = %d, want 1", got)
+	}
+	if got := misses.Load(); got != 1 {
+		t.Fatalf("miss callbacks = %d, want 1", got)
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("hit callbacks = %d, want 1", got)
+	}
+
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dynamic?skip=1", nil))
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("handler calls after skip = %d, want 2", got)
+	}
+}
+
+func TestMiddlewareCacheByURIWithIgnoredQueryOrder(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+
+	store := persist.NewMemoryStore(time.Minute)
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
+
+	var calls atomic.Int32
+	router := gin.New()
+	router.GET("/search",
+		CacheByRequestURI(store, time.Minute, WithIgnoreQueryOrder()),
+		func(c *gin.Context) {
+			n := calls.Add(1)
+			c.JSON(http.StatusOK, gin.H{"call": n})
+		},
+	)
+
+	for _, target := range []string{"/search?b=2&a=1", "/search?a=1&b=2"} {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want %d", target, rec.Code, http.StatusOK)
+		}
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("handler calls = %d, want 1", got)
+	}
+}
+
+func TestMiddlewareHeadReplayAndStringWrites(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+
+	store := persist.NewMemoryStore(time.Minute)
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
+
+	router := gin.New()
+	router.HEAD("/head",
+		CacheByRequestPath(store, time.Minute),
+		func(c *gin.Context) {
+			c.Header("ETag", "etag-head")
+			c.String(http.StatusOK, "ignored")
+		},
+	)
+
+	first := httptest.NewRecorder()
+	router.ServeHTTP(first, httptest.NewRequest(http.MethodHead, "/head", nil))
+
+	second := httptest.NewRecorder()
+	router.ServeHTTP(second, httptest.NewRequest(http.MethodHead, "/head", nil))
+
+	if got := second.Header().Get("X-Cache"); got != "HIT" {
+		t.Fatalf("HEAD X-Cache = %q, want HIT", got)
+	}
+	if second.Body.Len() != 0 {
+		t.Fatalf("HEAD cached body length = %d, want 0", second.Body.Len())
+	}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	cw := getWriter(ctx.Writer, 0)
+	t.Cleanup(func() {
+		putWriter(cw)
+	})
+	if _, err := cw.WriteString("hello"); err != nil {
+		t.Fatalf("WriteString error: %v", err)
+	}
+	if cw.Status() != http.StatusOK {
+		t.Fatalf("Status = %d, want %d", cw.Status(), http.StatusOK)
+	}
+	if !strings.Contains(rec.Body.String(), "hello") {
+		t.Fatalf("response body = %q, want hello", rec.Body.String())
+	}
+}
+
+func TestSerializeDeserializeResponseCache(t *testing.T) {
+	t.Parallel()
+
+	resp := &ResponseCache{
+		Status: http.StatusAccepted,
+		Header: map[string]string{
+			"ETag": "etag-serialize",
+		},
+		Body: []byte("cached"),
+	}
+
+	data, err := Serialize(resp)
+	if err != nil {
+		t.Fatalf("Serialize error: %v", err)
+	}
+	got, err := Deserialize(data)
+	if err != nil {
+		t.Fatalf("Deserialize error: %v", err)
+	}
+	if got.Status != resp.Status || string(got.Body) != "cached" || got.Header["ETag"] != "etag-serialize" {
+		t.Fatalf("Deserialize = %#v, want original response fields", got)
+	}
+}
+
+func TestMiddlewareDisableSingleFlightAndSkipLargeBody(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+
+	store := persist.NewMemoryStore(time.Minute)
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
+
+	logger := &testLogger{}
+	var calls atomic.Int32
+
+	router := gin.New()
+	router.GET("/large",
+		CacheByRequestPath(store, time.Minute,
+			WithDisableSingleFlight(),
+			WithMaxBodySize(4),
+			WithLogger(logger),
+		),
+		func(c *gin.Context) {
+			calls.Add(1)
+			c.String(http.StatusOK, "too-large")
+		},
+	)
+
+	for range 2 {
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/large", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if got := rec.Header().Get("X-Cache"); got == "HIT" {
+			t.Fatal("large response should not be cached")
+		}
+	}
+
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("handler calls = %d, want 2", got)
+	}
+	if !logger.contains("body exceeded max cache size") {
+		t.Fatalf("logger entries = %#v, want large body debug message", logger.entries)
+	}
+}
+
+func TestCacheShortcutAndShareSingleFlightCallback(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+
+	store := persist.NewMemoryStore(time.Minute)
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
+
+	var shared atomic.Int32
+	var calls atomic.Int32
+
+	router := gin.New()
+	router.GET("/shortcut",
+		Cache(store, time.Minute,
+			WithCacheStrategyByRequest(func(*gin.Context) (bool, Strategy) {
+				return true, Strategy{CacheKey: "shortcut"}
+			}),
+			WithOnShareSingleFlight(func(*gin.Context) {
+				shared.Add(1)
+			}),
+			WithSingleFlightForgetTimeout(time.Second),
+		),
+		func(c *gin.Context) {
+			n := calls.Add(1)
+			time.Sleep(50 * time.Millisecond)
+			c.JSON(http.StatusOK, gin.H{"call": n})
+		},
+	)
+
+	const requestCount = 4
+	var wg sync.WaitGroup
+	for range requestCount {
+		wg.Go(func() {
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/shortcut", nil))
+			if rec.Code != http.StatusOK {
+				t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+			}
+		})
+	}
+	wg.Wait()
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("handler calls = %d, want 1", got)
+	}
+	if got := shared.Load(); got == 0 {
+		t.Fatal("shared singleflight callback was not called")
+	}
+}
+
+type testLogger struct {
+	mu      sync.Mutex
+	entries []string
+}
+
+func (l *testLogger) Errorf(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.entries = append(l.entries, fmt.Sprintf(format, args...))
+}
+
+func (l *testLogger) Debugf(format string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.entries = append(l.entries, fmt.Sprintf(format, args...))
+}
+
+func (l *testLogger) contains(part string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, entry := range l.entries {
+		if strings.Contains(entry, part) {
+			return true
+		}
+	}
+	return false
 }

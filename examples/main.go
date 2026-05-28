@@ -111,6 +111,8 @@ func main() {
 	}
 	log.Println("Redis connected")
 
+	logger := &stdLogger{}
+
 	// =====================================================================
 	// 初始化缓存存储
 	// =====================================================================
@@ -127,20 +129,31 @@ func main() {
 		persist.WithLocalTTL(15*time.Second),
 		persist.WithRemoteTTL(5*time.Minute),
 		persist.WithTwoLevelKeyPrefix("myapp:hot:"),
+		persist.WithTwoLevelLogger(logger),
+		persist.WithTwoLevelInvalidationBroadcast(redisClient, "myapp:gincache:l1:invalidate"),
+		persist.WithTwoLevelInvalidationTimeout(5*time.Second),
+		persist.WithTwoLevelSingleFlightForgetTimeout(3*time.Second),
 	)
-	defer twoLevelStore.Close()
+	defer func() {
+		if err := twoLevelStore.Close(); err != nil {
+			log.Printf("close two level store failed: %v", err)
+		}
+	}()
 
 	// 方案 3: 纯内存缓存（适合单实例、开发环境）
 	memoryStore := persist.NewMemoryStore(time.Minute,
 		persist.WithCleanupInterval(30*time.Second),
 	)
-	defer memoryStore.Close()
+	defer func() {
+		if err := memoryStore.Close(); err != nil {
+			log.Printf("close memory store failed: %v", err)
+		}
+	}()
 
 	// =====================================================================
 	// 缓存统计
 	// =====================================================================
 	stats := &CacheStats{}
-	logger := &stdLogger{}
 
 	// 公共 Option
 	commonOpts := []gincache.Option{
