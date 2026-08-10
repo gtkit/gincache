@@ -73,10 +73,40 @@ type Config struct {
 	disableSingleFlight       bool         // 禁用 singleflight
 	maxBodySize               int64        // 最大缓存 Body 大小，0 表示不限制
 	cacheableStatusCodes      map[int]bool // 可缓存的状态码，nil 表示只缓存 2xx
+	cacheableResponse         CacheableResponse
 }
 
 // Option 配置选项.
 type Option func(*Config)
+
+// CacheableResponse 判定一个**已经产生的响应**能否进缓存。
+//
+// 为什么需要它：WithCacheStrategyByRequest 是请求期判据，那时响应头还不存在，
+// 因此无法表达"这个响应不该被共享缓存"。而本包会把响应头连同 Body 一起缓存
+// 并在命中时回放（只排除 X-Cache），于是以下三类响应一旦被缓存就是数据泄漏
+// 或语义错误，且调用方无法阻止：
+//
+//	Set-Cookie —— 回放给后续所有请求，等于把第一个用户的会话发给别人；
+//	Cache-Control: private / no-store —— handler 明确声明不可共享缓存，
+//	  而本包此前不看这个头；
+//	Vary —— 缓存键不含它列出的请求头，不同 Accept-* 会拿到同一份响应。
+//
+// 判据在状态码检查之后、写入 store 之前调用，此时 resp.Headers 已完整。
+// 返回 false 即跳过缓存，本次响应照常发给客户端。
+//
+// **传入的是 header 的副本**：http.Header 是 map，直接把 resp.Headers 交出去
+// 等于允许判据改写随后写入 store 的缓存内容——一个只该"判断"的回调却能改数据，
+// 而调用方不会意识到自己有这个能力。副本的成本是每次 miss 一次浅拷贝，
+// 换来的是这个保证真的成立，而不只是写在注释里。
+type CacheableResponse func(status int, header http.Header) bool
+
+// WithCacheableResponse 设置响应期缓存判据。
+//
+// 不设时行为与本选项引入之前完全一致（只按状态码判定），因此对既有调用方
+// 向后兼容。需要防上述三类泄漏的调用方必须显式设置它。
+func WithCacheableResponse(fn CacheableResponse) Option {
+	return func(c *Config) { c.cacheableResponse = fn }
+}
 
 // WithCacheStrategyByRequest 设置自定义缓存策略.
 func WithCacheStrategyByRequest(fn GetCacheStrategyByRequest) Option {
@@ -495,11 +525,28 @@ func (m *Middleware) cacheResponse(key string, resp *ResponseCache, store persis
 }
 
 func (m *Middleware) shouldCache(resp *ResponseCache) bool {
+	if !m.statusCacheable(resp.Status) {
+		return false
+	}
+
+	// 响应期判据放在状态码之后：状态码不可缓存时无需再问调用方，
+	// 而调用方的判据要能看到完整响应头（Set-Cookie / Cache-Control / Vary）。
+	if m.cfg.cacheableResponse != nil && !m.cfg.cacheableResponse(resp.Status, resp.Headers.Clone()) {
+		if m.cfg.logger != nil {
+			m.cfg.logger.Debugf("gincache: response rejected by CacheableResponse, skip cache")
+		}
+		return false
+	}
+
+	return true
+}
+
+func (m *Middleware) statusCacheable(status int) bool {
 	if m.cfg.cacheableStatusCodes != nil {
-		return m.cfg.cacheableStatusCodes[resp.Status]
+		return m.cfg.cacheableStatusCodes[status]
 	}
 	// 默认只缓存 2xx
-	return resp.Status >= 200 && resp.Status < 300
+	return status >= 200 && status < 300
 }
 
 func (m *Middleware) writeResponse(c *gin.Context, resp *ResponseCache) {

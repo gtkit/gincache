@@ -118,3 +118,36 @@ func TestCacheableResponseDefaultsToStatusOnly(t *testing.T) {
 		t.Fatalf("handler 被调用 %d 次，want 1（未设判据时行为应与从前一致）", got)
 	}
 }
+
+// TestCacheableResponseCannotMutateCache 钉住判据拿到的是副本。
+//
+// http.Header 是 map，把内部实例交给回调等于允许它改写随后写入 store 的内容——
+// 一个只该"判断"的回调却能改数据，而调用方不会意识到自己有这个能力。
+func TestCacheableResponseCannotMutateCache(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store := persist.NewMemoryStore(time.Minute)
+	engine := gin.New()
+	engine.Use(Cache(store, time.Minute,
+		WithCacheStrategyByRequest(func(c *gin.Context) (bool, Strategy) {
+			return true, Strategy{CacheKey: c.Request.URL.Path}
+		}),
+		WithCacheableResponse(func(_ int, header http.Header) bool {
+			// 判据试图注入一个头：它只该看，不该改。
+			header.Set("X-Injected-By-Predicate", "yes")
+			return true
+		}),
+	))
+	engine.GET("/x", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	// 第一次回源并写缓存，第二次命中回放。
+	engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+	second := httptest.NewRecorder()
+	engine.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/x", nil))
+
+	if got := second.Header().Get("X-Injected-By-Predicate"); got != "" {
+		t.Fatalf("判据注入的头进了缓存并被回放（值 %q）：它拿到的不是副本", got)
+	}
+}
