@@ -18,12 +18,16 @@
 
 ### Security
 
-- **⚠ 破坏性变更**：默认拒绝缓存携带 `Set-Cookie`、`Cache-Control: no-store` 或 `Cache-Control: private` 的响应。此前这类响应会被缓存并回放给后续所有请求，等于把第一个用户的会话发给别人。需要恢复旧行为的调用方可传入恒为真的判据：`WithCacheableResponse(func(int, http.Header) bool { return true })`。
+- **⚠ 破坏性变更**：默认拒绝缓存携带 `Set-Cookie`、`Cache-Control: no-store`、`Cache-Control: private` 或 `Cache-Control: no-cache` 的响应。`no-cache` 的语义是"未经重新验证不得复用"，而本包没有 revalidation 机制，存了就必然无验证复用。此前这类响应会被缓存并回放给后续所有请求，等于把第一个用户的会话发给别人。需要恢复旧行为的调用方可传入恒为真的判据：`WithCacheableResponse(func(int, http.Header) bool { return true })`。
 - **⚠ 破坏性变更**：singleflight 把 leader 的响应交给并发等待者之前同样复检。这条路径绕过 store，此前完全不受任何判据保护，leader 的 `Set-Cookie` 会被原样发给所有同 key 的并发等待者。复检不通过时等待者改为执行自己的 handler。
 
-- **⚠ 破坏性变更**：`CacheByRequestURI` 与 `CacheByRequestPath` 的缓存键纳入 HTTP method，键格式变为 `"<method> <uri>"`；`HEAD` 归一为 `GET` 以保留复用 `GET` 条目的能力。此前挂在 `r.Any()` 或混方法路由组下时，`POST` 会复用 `GET` 的响应。升级后旧缓存条目会落空一次，属于一次冷启动。
+- **⚠ 破坏性变更**：`CacheByRequestURI` 与 `CacheByRequestPath` 的缓存键纳入 HTTP method，键格式变为 `"<method> <uri>"`，`GET` 与 `HEAD` 各用各的键。此前挂在 `r.Any()` 或混方法路由组下时，`POST` 会复用 `GET` 的响应；而把 `HEAD` 归一到 `GET` 键上会让"HEAD 分支不产出 Body"的普通 handler 在 HEAD 先到时把空条目写进 `GET` 键。升级后旧缓存条目会落空一次，属于一次冷启动。
+- **⚠ 破坏性变更**：`CacheByRequestURI` 与 `CacheByRequestPath` 只缓存 `GET` 与 `HEAD`，其余方法直接放行。此前 `POST` / `PUT` / `DELETE` 的响应会被缓存并回放，让后续同键请求跳过业务处理——副作用不会发生而调用方收到成功响应。需要缓存这些方法的调用方改用 `Cache` 配合 `WithCacheStrategyByRequest`。
+- **⚠ 破坏性变更**：`CacheByRequestURI` 与 `CacheByRequestPath` 对携带 `Authorization` 的请求整体绕过缓存。内置键不含任何请求头，无从区分不同凭据的用户（RFC 9111 §3.5）。需要缓存这类响应的调用方改用 `Cache` 配合 `WithCacheStrategyByRequest` 自行拼键。
+- **⚠ 破坏性变更**：响应头的键在写入缓存与命中回放前统一规范化。此前 handler 通过直接写 map（而非 `Header.Set`）留下的 `set-cookie`、`connection` 这类非规范键能绕过准入基线与逐跳 header 过滤，让 `Set-Cookie` 完整地进缓存再发出去。
 - **⚠ 破坏性变更**：`New` 在 store 为 nil 或默认 TTL 为负数时于构造期 panic 并给出明确信息，`opts` 中的 nil 元素被跳过。此前 nil store 要等第一个请求进来才以 nil 解引用的形式暴露。
 - `WithMaxBodySize` 与 `WithSingleFlightForgetTimeout` 忽略负数入参，保持各自"不限制"与"不设定时器"的默认语义。
+- `NewTwoLevelStore` 在 client 为 nil 时于构造期 panic 并给出明确信息，`opts` 中的 nil 元素被跳过；`WithLocalTTL` 与 `WithRemoteTTL` 忽略负数入参。此前 nil client 要等第一次读写才以 nil 解引用的形式暴露。
 
 ### Deprecated
 ### Removed

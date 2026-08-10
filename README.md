@@ -31,9 +31,10 @@
 - 支持按完整 URI 缓存
 - 支持按路径缓存
 - 支持动态缓存策略
+- 内置中间件只缓存 `GET` / `HEAD`，并绕过携带 `Authorization` 的请求
 - 默认缓存 `2xx`（排除 `206`）
 - 支持自定义可缓存状态码
-- 内置准入基线：默认拒绝缓存 `Set-Cookie`、`Cache-Control: no-store` / `private` 的响应
+- 内置准入基线：默认拒绝缓存 `Set-Cookie`、`Cache-Control: no-store` / `private` / `no-cache` 的响应
 - 支持自定义响应期缓存判据，写入、命中回放、singleflight 共享三个时机统一生效
 - 内置 `singleflight` 防击穿
 - 支持响应体大小限制
@@ -190,14 +191,25 @@ r.GET("/products/:id",
 )
 ```
 
+#### 这两个中间件缓存哪些请求
+
+只缓存 **`GET` 与 `HEAD`**，其余方法直接放行不缓存。缓存一次 `POST` / `PUT` / `DELETE`
+的响应并回放，等于让后续同键请求跳过业务处理——副作用不会发生，调用方却收到成功响应。
+
+**携带 `Authorization` 的请求整体绕过**，既不读也不写。内置缓存键不含任何请求头，无从
+区分不同凭据的用户；RFC 9111 §3.5 也规定共享缓存不得复用带 `Authorization` 请求的响应。
+
+需要缓存非安全方法或带凭据的响应，改用下面的 `Cache + WithCacheStrategyByRequest`，
+在 `Strategy.CacheKey` 里自行拼入所需维度——那条路径不受这两条限制。
+
 #### 这两个中间件的缓存键构成
 
-缓存键为 `"<method> <uri>"` 或 `"<method> <path>"`，因此不同 HTTP method 的响应互不复用；
-`HEAD` 归一为 `GET`，可以复用 `GET` 写入的条目。
+缓存键为 `"<method> <uri>"` 或 `"<method> <path>"`。`GET` 与 `HEAD` **各用各的键**，
+互不复用：`HEAD` 若归一到 `GET` 键上，一个"HEAD 分支不产出 Body"的普通 handler 只要
+先被 HEAD 请求命中一次，就会把空条目写进 `GET` 键，随后的 `GET` 拿到空响应。
 
-键中**不含任何请求头**——`Authorization`、Cookie、`Accept-*` 都不在内。按用户区分的响应
-用它们缓存会把第一个用户的内容发给后续所有人，这类接口必须改用下面的
-`Cache + WithCacheStrategyByRequest`，在 `Strategy.CacheKey` 里自行拼入用户维度。
+键中**不含任何请求头**——Cookie、`Accept-*` 都不在内。响应内容随请求头变化的接口
+（典型信号是响应带 `Vary`）必须改用 `Cache + WithCacheStrategyByRequest` 自行拼键。
 
 ### 3. `Cache + WithCacheStrategyByRequest`
 
@@ -301,14 +313,23 @@ gincache.WithMaxBodySize(1 << 20) // 1MB
 
 #### 内置基线 `DefaultCacheableResponse`
 
-不设 `WithCacheableResponse` 时，内置基线默认生效，拒绝三类响应：
+不设 `WithCacheableResponse` 时，内置基线默认生效，拒绝这些响应：
 
 - 携带任意 `Set-Cookie` 的响应
 - `Cache-Control` 指令中出现 `no-store` 的响应
 - `Cache-Control` 指令中出现 `private` 的响应
+- `Cache-Control` 指令中出现 `no-cache` 的响应
 
 指令按逗号切分后逐个比对、大小写不敏感、不做子串匹配，`no-store-hint` 之类的自定义
 指令不会被误判。
+
+`no-cache` 的语义是"未经重新验证不得复用"而不是"不得存储"。本包没有 revalidation
+机制，存了就必然无验证复用——"允许存储"这一半没有任何可利用的余地，因此对本包
+而言 `no-cache` 等价于不可缓存。
+
+响应头的键会在写入与回放前统一规范化。`http.Header` 底层是 map，`Header.Set` 会规范化
+键而直接写 map 不会；不归一的话，一句 `c.Writer.Header()["set-cookie"] = ...` 就能让
+`Set-Cookie` 绕过上面这些检查。
 
 `WithCacheableResponse` **替换**基线而不是叠加。替换是为了保留一个合法用法：缓存键里
 已经带了用户维度时，缓存 `Cache-Control: private` 的响应是正确的。需要"基线加上自己的
@@ -341,12 +362,43 @@ gincache.WithCacheableResponse(func(int, http.Header) bool { return true })
   `Trailer`、`Transfer-Encoding`、`Upgrade`、`Proxy-Authenticate`、`Proxy-Authorization`，
   以及 `Connection` 头值中列出的字段名。
 
-#### 认证响应必须自己拼键
+#### 按请求头区分的响应必须自己拼键
 
-`CacheByRequestURI` 和 `CacheByRequestPath` 的缓存键只有 URI 或 Path，**不含
-`Authorization`、Cookie 或任何其他请求头**。用它们缓存按用户区分的响应会把第一个用户的
+内置中间件已经绕过带 `Authorization` 的请求，但缓存键仍然不含 Cookie、`Accept-*` 等
+任何其他请求头。响应内容随这些请求头变化的接口，用内置中间件缓存会把第一个用户的
 内容发给后续所有人。这类接口必须走 `Cache + WithCacheStrategyByRequest`，在
-`Strategy.CacheKey` 里显式拼进用户维度。
+`Strategy.CacheKey` 里显式拼进相应维度：
+
+```go
+gincache.WithCacheStrategyByRequest(func(c *gin.Context) (bool, gincache.Strategy) {
+    userID := c.GetString("user_id") // 由你的鉴权中间件写入
+    return true, gincache.Strategy{CacheKey: "profile:" + userID}
+})
+```
+
+#### 请求端的 `Cache-Control: no-cache` 不被遵守
+
+客户端在请求里带 `Cache-Control: no-cache` 或 `Pragma: no-cache` 时，本包仍会回放缓存。
+这是有意的：遵守它等于开放一个人人可用的缓存击穿入口，任何客户端加一个请求头就能强制
+回源，对昂贵接口就是免费的 DoS——生产级缓存（nginx `proxy_cache`、各家 CDN）普遍出于
+同样理由默认忽略它。
+
+需要遵守的场景用现成的 `WithCacheStrategyByRequest` 表达即可，不必额外配置：
+
+```go
+gincache.WithCacheStrategyByRequest(func(c *gin.Context) (bool, gincache.Strategy) {
+    if strings.Contains(c.GetHeader("Cache-Control"), "no-cache") {
+        return false, gincache.Strategy{}
+    }
+    return true, gincache.Strategy{CacheKey: c.Request.URL.Path}
+})
+```
+
+#### 条件请求不产生 304
+
+客户端带 `If-None-Match` 或 `If-Modified-Since` 时，缓存命中会回放完整的 `200` 响应
+（包含原始的 `ETag` / `Last-Modified`），而不是 `304 Not Modified`。响应内容是正确的，
+代价是多一份 Body 的带宽。
 
 ### `WithDisableSingleFlight`
 

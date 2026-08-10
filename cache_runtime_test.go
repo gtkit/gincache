@@ -70,10 +70,12 @@ func TestCacheKeySameMethodStillHits(t *testing.T) {
 	}
 }
 
-// TestCacheKeyHeadReusesGetEntry 钉住 HEAD 归一为 GET 后仍能复用 GET 的条目。
+// TestCacheKeyHeadDoesNotPoisonGet 钉住 HEAD 先到不会污染 GET 条目。
 //
-// writeResponse 里按 method 抑制 Body 的分支正是为这个复用而存在。
-func TestCacheKeyHeadReusesGetEntry(t *testing.T) {
+// 曾经把 HEAD 归一为 GET，只顾了读方向：HEAD 首次未命中会把 HEAD 专属响应
+// （这里的 handler 在 HEAD 分支不产出 Body，是最常见的写法）写进 GET 键，
+// 随后的 GET 命中一个空条目。
+func TestCacheKeyHeadDoesNotPoisonGet(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	var calls atomic.Int32
@@ -84,18 +86,53 @@ func TestCacheKeyHeadReusesGetEntry(t *testing.T) {
 	handler := func(c *gin.Context) {
 		calls.Add(1)
 		c.Header("ETag", "etag-1")
+		if c.Request.Method == http.MethodHead {
+			c.Status(http.StatusOK)
+			return
+		}
 		c.String(http.StatusOK, "payload")
 	}
 	router.GET("/x", CacheByRequestPath(store, time.Minute), handler)
 	router.HEAD("/x", CacheByRequestPath(store, time.Minute), handler)
 
-	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodHead, "/x", nil))
+
+	get := httptest.NewRecorder()
+	router.ServeHTTP(get, httptest.NewRequest(http.MethodGet, "/x", nil))
+
+	if got := get.Header().Get("X-Cache"); got == "HIT" {
+		t.Fatal("GET 命中了 HEAD 写入的条目")
+	}
+	if got := get.Body.String(); got != "payload" {
+		t.Fatalf("GET body = %q, want %q（拿到了 HEAD 写下的空条目）", got, "payload")
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("handler 被调用 %d 次，want 2", got)
+	}
+}
+
+// TestCacheKeyHeadHitsOwnEntry 钉住 HEAD 命中自己写入的条目且不写出 Body。
+func TestCacheKeyHeadHitsOwnEntry(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var calls atomic.Int32
+	store := persist.NewMemoryStore(time.Minute)
+	t.Cleanup(func() { _ = store.Close() })
+
+	router := gin.New()
+	router.HEAD("/x", CacheByRequestPath(store, time.Minute), func(c *gin.Context) {
+		calls.Add(1)
+		c.Header("ETag", "etag-1")
+		c.String(http.StatusOK, "payload")
+	})
+
+	router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodHead, "/x", nil))
 
 	head := httptest.NewRecorder()
 	router.ServeHTTP(head, httptest.NewRequest(http.MethodHead, "/x", nil))
 
 	if got := head.Header().Get("X-Cache"); got != "HIT" {
-		t.Fatalf("HEAD X-Cache = %q, want HIT（HEAD 应复用 GET 的条目）", got)
+		t.Fatalf("HEAD X-Cache = %q, want HIT", got)
 	}
 	if head.Body.Len() != 0 {
 		t.Fatalf("HEAD body 长度 = %d, want 0", head.Body.Len())
@@ -105,6 +142,137 @@ func TestCacheKeyHeadReusesGetEntry(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("handler 被调用 %d 次，want 1", got)
+	}
+}
+
+// TestUnsafeMethodsNotCached 钉住内置中间件不缓存非安全方法。
+//
+// 缓存一次 POST 的响应并回放，等于让后续同键请求跳过业务处理——副作用不会
+// 发生，调用方却收到成功响应。
+func TestUnsafeMethodsNotCached(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch} {
+		t.Run(method, func(t *testing.T) {
+			var calls atomic.Int32
+			store := persist.NewMemoryStore(time.Minute)
+			t.Cleanup(func() { _ = store.Close() })
+
+			router := gin.New()
+			router.Handle(method, "/order", CacheByRequestPath(store, time.Minute), func(c *gin.Context) {
+				n := calls.Add(1)
+				c.JSON(http.StatusOK, gin.H{"order": n})
+			})
+
+			var last string
+			for range 2 {
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, httptest.NewRequest(method, "/order", nil))
+				if got := rec.Header().Get("X-Cache"); got == "HIT" {
+					t.Fatalf("%s 命中了缓存", method)
+				}
+				last = rec.Body.String()
+			}
+
+			if got := calls.Load(); got != 2 {
+				t.Fatalf("handler 被调用 %d 次，want 2：%s 的响应被缓存并跳过了业务处理", got, method)
+			}
+			if last != `{"order":2}` {
+				t.Fatalf("第二次响应 = %s, want {\"order\":2}", last)
+			}
+		})
+	}
+}
+
+// TestAuthorizedRequestBypassesBuiltinCache 钉住带 Authorization 的请求绕过内置中间件。
+//
+// 内置键不含任何请求头，无从区分不同凭据的用户；RFC 9111 §3.5 也规定共享缓存
+// 不得复用带 Authorization 请求的响应。
+func TestAuthorizedRequestBypassesBuiltinCache(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	newRouter := func(store persist.CacheStore, calls *atomic.Int32) *gin.Engine {
+		router := gin.New()
+		router.GET("/me", CacheByRequestPath(store, time.Minute), func(c *gin.Context) {
+			n := calls.Add(1)
+			c.JSON(http.StatusOK, gin.H{"user": n})
+		})
+		return router
+	}
+
+	t.Run("不读缓存", func(t *testing.T) {
+		var calls atomic.Int32
+		store := persist.NewMemoryStore(time.Minute)
+		t.Cleanup(func() { _ = store.Close() })
+		router := newRouter(store, &calls)
+
+		// 先用匿名请求把条目写进缓存。
+		router.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/me", nil))
+
+		authed := httptest.NewRequest(http.MethodGet, "/me", nil)
+		authed.Header.Set("Authorization", "Bearer token-a")
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, authed)
+
+		if got := rec.Header().Get("X-Cache"); got == "HIT" {
+			t.Fatal("带 Authorization 的请求命中了共享缓存")
+		}
+		if got := calls.Load(); got != 2 {
+			t.Fatalf("handler 被调用 %d 次，want 2", got)
+		}
+	})
+
+	t.Run("不写缓存", func(t *testing.T) {
+		var calls atomic.Int32
+		store := persist.NewMemoryStore(time.Minute)
+		t.Cleanup(func() { _ = store.Close() })
+		router := newRouter(store, &calls)
+
+		authed := httptest.NewRequest(http.MethodGet, "/me", nil)
+		authed.Header.Set("Authorization", "Bearer token-a")
+		router.ServeHTTP(httptest.NewRecorder(), authed)
+
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/me", nil))
+
+		if got := rec.Header().Get("X-Cache"); got == "HIT" {
+			t.Fatal("匿名请求命中了带 Authorization 请求写下的条目")
+		}
+		if got := calls.Load(); got != 2 {
+			t.Fatalf("handler 被调用 %d 次，want 2", got)
+		}
+	})
+}
+
+// TestCustomStrategyNotGatedByRequest 钉住请求维度门禁只作用于内置中间件。
+//
+// 走 Cache + WithCacheStrategyByRequest 的调用方已经显式表达了"缓存这个请求"，
+// 那是他们的判断，本包不代为否决。
+func TestCustomStrategyNotGatedByRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var calls atomic.Int32
+	store := persist.NewMemoryStore(time.Minute)
+	t.Cleanup(func() { _ = store.Close() })
+
+	router := gin.New()
+	router.POST("/search", Cache(store, time.Minute,
+		WithCacheStrategyByRequest(func(c *gin.Context) (bool, Strategy) {
+			return true, Strategy{CacheKey: "search:" + c.GetHeader("Authorization")}
+		}),
+	), func(c *gin.Context) {
+		calls.Add(1)
+		c.JSON(http.StatusOK, gin.H{"hits": 1})
+	})
+
+	for range 2 {
+		req := httptest.NewRequest(http.MethodPost, "/search", nil)
+		req.Header.Set("Authorization", "Bearer token-a")
+		router.ServeHTTP(httptest.NewRecorder(), req)
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("handler 被调用 %d 次，want 1：自定义策略不该受内置请求门禁限制", got)
 	}
 }
 

@@ -43,17 +43,21 @@ type TwoLevelLogger interface {
 	Errorf(format string, args ...any)
 }
 
-// WithLocalTTL 设置本地缓存默认 TTL。
+// WithLocalTTL 设置本地缓存默认 TTL。负数入参被忽略，保持默认值。
 func WithLocalTTL(ttl time.Duration) TwoLevelStoreOption {
 	return func(s *TwoLevelStore) {
-		s.localTTL = ttl
+		if ttl >= 0 {
+			s.localTTL = ttl
+		}
 	}
 }
 
-// WithRemoteTTL 设置远端 Redis 默认 TTL。
+// WithRemoteTTL 设置远端 Redis 默认 TTL。负数入参被忽略，保持默认值。
 func WithRemoteTTL(ttl time.Duration) TwoLevelStoreOption {
 	return func(s *TwoLevelStore) {
-		s.remoteTTL = ttl
+		if ttl >= 0 {
+			s.remoteTTL = ttl
+		}
 	}
 }
 
@@ -109,7 +113,14 @@ func WithTwoLevelInvalidationBroadcast(client redis.UniversalClient, channel str
 }
 
 // NewTwoLevelStore 创建一个 L1 可插拔、L2 为 Redis 的两级缓存。
+//
+// 配置错误在这里就地 panic，而不是拖到第一次读写时才以 nil 解引用的形式暴露：
+// redisClient 为 nil 即 panic，opts 中的 nil 元素被跳过。
 func NewTwoLevelStore(redisClient redis.Cmdable, opts ...TwoLevelStoreOption) *TwoLevelStore {
+	if redisClient == nil {
+		panic("gincache: redisClient must not be nil")
+	}
+
 	s := &TwoLevelStore{
 		localTTL:            30 * time.Second,
 		remoteTTL:           5 * time.Minute,
@@ -119,7 +130,11 @@ func NewTwoLevelStore(redisClient redis.Cmdable, opts ...TwoLevelStoreOption) *T
 	}
 
 	for _, opt := range opts {
-		opt(s)
+		// 跳过而不是 panic：`var opt TwoLevelStoreOption; if cond { opt = WithX() }`
+		// 是常见的条件构造写法。
+		if opt != nil {
+			opt(s)
+		}
 	}
 
 	if s.local == nil {

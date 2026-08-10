@@ -46,7 +46,10 @@ func TestDefaultCacheableResponse(t *testing.T) {
 		{"带空格的指令拒绝", http.Header{"Cache-Control": {"public,   private"}}, false},
 		{"private 带参数拒绝", http.Header{"Cache-Control": {`private="X-Foo"`}}, false},
 		{"多个 Cache-Control 头拒绝", http.Header{"Cache-Control": {"max-age=60", "no-store"}}, false},
-		{"no-cache 放行", http.Header{"Cache-Control": {"no-cache"}}, true},
+		// no-cache 的语义是"未经重新验证不得复用"。本包没有 revalidation，
+		// 存了就必然无验证复用，因此等价于不可缓存。
+		{"no-cache 拒绝", http.Header{"Cache-Control": {"no-cache"}}, false},
+		{"no-cache 混在其他指令中拒绝", http.Header{"Cache-Control": {"max-age=60, no-cache"}}, false},
 		{"public 放行", http.Header{"Cache-Control": {"public, max-age=60"}}, true},
 		{"指令名不做子串匹配", http.Header{"Cache-Control": {"no-store-hint=1"}}, true},
 		{"privately 不误判", http.Header{"Cache-Control": {"privately"}}, true},
@@ -312,6 +315,109 @@ func TestHopByHopHeadersStrippedOnWrite(t *testing.T) {
 	}
 }
 
+// TestNonCanonicalHeaderKeysCannotBypassAdmission 钉住非规范键绕不过准入与逐跳过滤。
+//
+// http.Header 底层是 map：Header.Set 会规范化键，直接写 map 不会。而准入基线按
+// 规范键查找、逐跳过滤按规范键索引 map——不归一，一句
+// c.Writer.Header()["set-cookie"] = ... 就能让 Set-Cookie 完整地进缓存再发出去。
+func TestNonCanonicalHeaderKeysCannotBypassAdmission(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	t.Run("小写 set-cookie 被基线挡住", func(t *testing.T) {
+		var calls atomic.Int32
+		store := persist.NewMemoryStore(time.Minute)
+		engine := admissionEngine(store)
+		engine.GET("/x", func(c *gin.Context) {
+			calls.Add(1)
+			c.Writer.Header()["set-cookie"] = []string{"session=abc"}
+			c.String(http.StatusOK, "ok")
+		})
+
+		for range 2 {
+			engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+		}
+
+		if got := calls.Load(); got != 2 {
+			t.Fatalf("handler 被调用 %d 次，want 2：小写 set-cookie 绕过了准入基线", got)
+		}
+		// 光看"没被回放"不够：条目根本就不该写进 store。把别人的会话存进共享
+		// Redis 本身就是问题，哪怕之后再也放不出来。
+		var cached ResponseCache
+		if err := store.Get("/x", &cached); err == nil {
+			t.Fatalf("带 Set-Cookie 的响应被写进了 store: %v", cached.Headers)
+		}
+	})
+
+	t.Run("小写 connection 被剔除", func(t *testing.T) {
+		store := persist.NewMemoryStore(time.Minute)
+		engine := admissionEngine(store)
+		engine.GET("/x", func(c *gin.Context) {
+			c.Writer.Header()["connection"] = []string{"keep-alive"}
+			c.String(http.StatusOK, "ok")
+		})
+
+		engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+
+		var cached ResponseCache
+		if err := store.Get("/x", &cached); err != nil {
+			t.Fatalf("缓存未写入: %v", err)
+		}
+		if got := cached.Headers.Get("Connection"); got != "" {
+			t.Fatalf("缓存里仍有 Connection = %q", got)
+		}
+		assertCanonicalKeys(t, cached.Headers, "缓存条目")
+
+		replay := httptest.NewRecorder()
+		engine.ServeHTTP(replay, httptest.NewRequest(http.MethodGet, "/x", nil))
+		if got := replay.Header().Get("X-Cache"); got != "HIT" {
+			t.Fatalf("X-Cache = %q, want HIT", got)
+		}
+		if got := replay.Header().Get("Connection"); got != "" {
+			t.Fatalf("回放写出了 Connection = %q", got)
+		}
+		assertCanonicalKeys(t, replay.Header(), "回放响应")
+	})
+
+	t.Run("历史条目的非规范键在回放时被处理", func(t *testing.T) {
+		store := persist.NewMemoryStore(time.Minute)
+		seedCache(t, store, "/x", &ResponseCache{
+			Status:  http.StatusOK,
+			Headers: http.Header{"set-cookie": {"session=leaked"}},
+			Body:    []byte("cached"),
+		})
+
+		engine := admissionEngine(store)
+		engine.GET("/x", func(c *gin.Context) { c.String(http.StatusOK, "fresh") })
+
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/x", nil))
+
+		if got := recorder.Body.String(); got != "fresh" {
+			t.Fatalf("body = %q, want %q（非规范键的历史条目被回放了）", got, "fresh")
+		}
+	})
+
+	t.Run("常规响应头行为不变", func(t *testing.T) {
+		store := persist.NewMemoryStore(time.Minute)
+		engine := admissionEngine(store)
+		engine.GET("/x", func(c *gin.Context) {
+			c.Header("ETag", "etag-1")
+			c.String(http.StatusOK, "ok")
+		})
+
+		engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+		replay := httptest.NewRecorder()
+		engine.ServeHTTP(replay, httptest.NewRequest(http.MethodGet, "/x", nil))
+
+		if got := replay.Header().Get("X-Cache"); got != "HIT" {
+			t.Fatalf("X-Cache = %q, want HIT", got)
+		}
+		if got := replay.Header().Get("ETag"); got != "etag-1" {
+			t.Fatalf("ETag = %q, want etag-1", got)
+		}
+	})
+}
+
 // TestHopByHopHeadersStrippedOnReplay 钉住历史条目回放时也剔除连接级 header。
 //
 // 写入侧过滤只管新数据；已经写进 store 的旧条目只能在回放侧补掉。
@@ -532,6 +638,17 @@ func ExampleWithCacheableResponse() {
 	// false
 	// false
 	// true
+}
+
+// assertCanonicalKeys 断言 header 里不存在非规范键。
+// 比断言某个具体小写键不存在更强：任何漏网的非规范键都会被抓到。
+func assertCanonicalKeys(t *testing.T, header http.Header, what string) {
+	t.Helper()
+	for key := range header {
+		if http.CanonicalHeaderKey(key) != key {
+			t.Fatalf("%s 中存在非规范 header 键 %q", what, key)
+		}
+	}
 }
 
 // seedCache 直接向 store 写入一个缓存条目，用于构造历史数据。

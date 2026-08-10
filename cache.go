@@ -89,7 +89,7 @@ type Option func(*Config)
 // 并在命中时回放，于是以下三类响应一旦被共享就是数据泄漏或语义错误：
 //
 //	Set-Cookie —— 回放给后续所有请求，等于把第一个用户的会话发给别人；
-//	Cache-Control: private / no-store —— handler 明确声明不可共享缓存；
+//	Cache-Control: private / no-store / no-cache —— handler 明确声明不可共享缓存；
 //	Vary —— 缓存键不含它列出的请求头，不同 Accept-* 会拿到同一份响应。
 //
 // 前两类由内置基线 DefaultCacheableResponse 默认挡住。Vary 不在基线内：
@@ -113,9 +113,13 @@ type CacheableResponse func(status int, header http.Header) bool
 
 // DefaultCacheableResponse 是未设置 WithCacheableResponse 时生效的内置准入基线。
 //
-// 它拒绝三类响应：携带任意 Set-Cookie 的响应，以及 Cache-Control 指令中出现
-// no-store 或 private 的响应。这三条在 RFC 9111 中对共享缓存是明确禁止或等价
-// 禁止的，且几乎不存在合法的共享缓存用途，误伤面接近零。
+// 它拒绝这些响应：携带任意 Set-Cookie 的响应，以及 Cache-Control 指令中出现
+// no-store、private 或 no-cache 的响应。它们在 RFC 9111 中对共享缓存是明确禁止
+// 或等价禁止的，且几乎不存在合法的共享缓存用途，误伤面接近零。
+//
+// no-cache 的语义是"未经重新验证不得复用"而非"不得存储"。本包没有 revalidation
+// 机制，存了就必然无验证复用——"允许存储"这一半没有任何可利用的余地，因此对
+// 本包而言 no-cache 等价于不可缓存。
 //
 // 指令按逗号切分后逐个比对、大小写不敏感、不做子串匹配——否则 no-store-hint
 // 之类的自定义指令会被误判。
@@ -135,7 +139,7 @@ func DefaultCacheableResponse(_ int, header http.Header) bool {
 		for directive := range strings.SplitSeq(value, ",") {
 			name, _, _ := strings.Cut(directive, "=")
 			switch strings.ToLower(strings.TrimSpace(name)) {
-			case "no-store", "private":
+			case "no-store", "private", "no-cache":
 				return false
 			}
 		}
@@ -268,14 +272,21 @@ func (m *Middleware) Handler() gin.HandlerFunc {
 
 // CacheByURI 按 HTTP method 与完整 URI 缓存的中间件.
 //
-// 缓存键为 "<method> <uri>"，因此不同 method 的响应互不复用；HEAD 归一为 GET，
-// 可以复用 GET 写入的条目。
+// 缓存键为 "<method> <uri>"，GET 与 HEAD 各用各的键，不同 method 的响应互不复用。
 //
-// 键中**不含任何请求头**（Authorization、Cookie、Accept-* 等）。按用户区分的
-// 响应用它缓存会把第一个用户的内容发给后续所有人——这类接口必须改用
-// Cache 配合 WithCacheStrategyByRequest，在 Strategy.CacheKey 里自行拼入用户维度。
+// 只处理 GET 与 HEAD，也只处理不带 Authorization 的请求，其余一律直接放行不缓存，
+// 原因见 cacheableRequest。需要缓存非安全方法或带凭据的响应，改用 Cache 配合
+// WithCacheStrategyByRequest，在 Strategy.CacheKey 里自行拼入所需维度。
+//
+// 键中**不含任何请求头**。响应内容随 Cookie、Accept-* 等请求头变化的接口
+// （典型信号是响应带 Vary）同样必须走 WithCacheStrategyByRequest 自行拼键。
 func (m *Middleware) CacheByURI() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if !cacheableRequest(c.Request) {
+			c.Next()
+			return
+		}
+
 		uri := c.Request.RequestURI
 		if m.cfg.ignoreQueryOrder {
 			uri = normalizeURI(c.Request.URL.Path, c.Request.URL.RawQuery)
@@ -286,22 +297,44 @@ func (m *Middleware) CacheByURI() gin.HandlerFunc {
 
 // CacheByPath 按 HTTP method 与路径缓存的中间件.
 //
-// 缓存键为 "<method> <path>"，请求头维度的约束与 CacheByURI 相同。
+// 缓存键为 "<method> <path>"，请求维度与请求头维度的约束与 CacheByURI 相同。
 func (m *Middleware) CacheByPath() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if !cacheableRequest(c.Request) {
+			c.Next()
+			return
+		}
+
 		m.handleWithKey(c, requestKey(c.Request.Method, c.Request.URL.Path))
 	}
+}
+
+// cacheableRequest 报告内置中间件能否让这个请求参与缓存。
+//
+// 只放行 GET 与 HEAD：缓存一次 POST / PUT / DELETE 的响应并回放，等于让后续同键
+// 请求跳过业务处理——副作用不会发生，调用方却收到成功响应。
+//
+// 带 Authorization 的请求整体绕过：内置键只由 method 与 URI 或 Path 构成，不含
+// 任何请求头，无从区分不同凭据的用户；RFC 9111 §3.5 也规定共享缓存不得复用带
+// Authorization 请求的响应。
+//
+// 两条限制都只作用于内置中间件。走 Cache + WithCacheStrategyByRequest 的调用方
+// 已经显式表达了"缓存这个请求"，那是他们的判断，本包不代为否决。
+func cacheableRequest(r *http.Request) bool {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+	return r.Header.Get("Authorization") == ""
 }
 
 // requestKey 把 method 拼进缓存键。不含 method 的键会让挂在 r.Any() 或混方法
 // 路由组下的 POST 复用 GET 的响应。
 //
-// HEAD 归一为 GET：RFC 9110 允许 HEAD 复用 GET 的缓存条目，而 writeResponse
-// 里按 method 抑制 Body 的分支正是为此存在。
+// HEAD 不归一为 GET：归一只顾了读方向，写方向上 HEAD 首次未命中会把 HEAD 专属
+// 响应（常见 handler 在 HEAD 分支不产出 Body）写进 GET 键，随后的 GET 命中一个
+// 空条目；singleflight 下 HEAD 做 leader 时，同键的 GET 等待者也会拿到 HEAD 的
+// 响应。分开键之后这类污染在结构上就不可能发生。
 func requestKey(method, uri string) string {
-	if method == http.MethodHead {
-		method = http.MethodGet
-	}
 	return method + " " + uri
 }
 
@@ -736,9 +769,30 @@ func cloneCachedHeaders(src http.Header) http.Header {
 	}
 
 	cloned := src.Clone()
+	// 规范化必须排在两个删除之前：它们都按规范键查找，非规范键会直接漏过去。
+	canonicalizeHeaderKeys(cloned)
 	delete(cloned, "X-Cache")
 	deleteHopByHopHeaders(cloned)
 	return cloned
+}
+
+// canonicalizeHeaderKeys 把非规范的 header 键就地并到规范键上。
+//
+// http.Header 底层是 map：Header.Set 会规范化键，而直接写 map 不会。准入基线按
+// 规范键查找、逐跳过滤按规范键索引 map，于是 handler 写一句
+// c.Writer.Header()["set-cookie"] = ... 就能让 Set-Cookie 完整地进缓存再发出去。
+// 从外部存储反序列化出的条目同理。
+func canonicalizeHeaderKeys(header http.Header) {
+	for key, values := range header {
+		canonical := http.CanonicalHeaderKey(key)
+		if canonical == key {
+			continue
+		}
+
+		delete(header, key)
+		// Clip 掉多余容量，避免 append 写进与其他键共享的底层数组。
+		header[canonical] = append(slices.Clip(header[canonical]), values...)
+	}
 }
 
 // cachedHeaderView 返回缓存条目的 header 视图：优先用完整集合，只有旧式单值
@@ -746,14 +800,15 @@ func cloneCachedHeaders(src http.Header) http.Header {
 // 是在写入侧过滤存在之前写进去的，只能在回放侧补掉。
 func cachedHeaderView(resp *ResponseCache) http.Header {
 	if len(resp.Headers) > 0 {
-		// 命中回放是热路径，而绝大多数响应一个连接级 header 都没有。先查再决定
-		// 是否克隆，常见情况下省掉一次整表拷贝；返回原表是安全的，两个调用方
-		// （回放写出、判据）都只读，交给调用方判据的还是另一份副本。
-		if !hasHopByHopHeaders(resp.Headers) {
+		// 命中回放是热路径，而本包写入的条目在写入侧已经规范化并剔除过逐跳 header，
+		// 回放时必然走这条快路径。返回原表是安全的：两个调用方（回放写出、判据）
+		// 都只读，交给调用方判据的还是另一份副本。
+		if !needsHeaderCleanup(resp.Headers) {
 			return resp.Headers
 		}
 
 		cloned := resp.Headers.Clone()
+		canonicalizeHeaderKeys(cloned)
 		deleteHopByHopHeaders(cloned)
 		return cloned
 	}
@@ -788,9 +843,17 @@ var hopByHopHeaders = []string{
 	"Proxy-Authorization",
 }
 
-// hasHopByHopHeaders 报告是否存在需要剔除的连接级 header。
-// Connection 缺席就意味着没有额外的逐跳字段名可派生，只查固定清单即可。
-func hasHopByHopHeaders(header http.Header) bool {
+// needsHeaderCleanup 报告 header 是否需要规范化键或剔除逐跳字段。
+// 两项都是无分配的扫描，用来在命中回放的热路径上判断能否跳过整表克隆。
+func needsHeaderCleanup(header http.Header) bool {
+	for key := range header {
+		if http.CanonicalHeaderKey(key) != key {
+			return true
+		}
+	}
+
+	// 键已全部规范，Connection 缺席就意味着没有额外的逐跳字段名可派生，
+	// 只查固定清单即可。
 	for _, name := range hopByHopHeaders {
 		if _, ok := header[name]; ok {
 			return true

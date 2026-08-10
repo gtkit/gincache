@@ -116,6 +116,40 @@ func TestTwoLevelStoreLogsLocalDeleteFailure(t *testing.T) {
 	}
 }
 
+// TestNewTwoLevelStoreValidatesConfiguration 钉住配置错误在构造期而不是首次读写时暴露。
+func TestNewTwoLevelStoreValidatesConfiguration(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil client 构造期 panic", func(t *testing.T) {
+		defer func() {
+			recovered := recover()
+			if recovered == nil {
+				t.Fatal("nil client 没有 panic")
+			}
+			if msg, _ := recovered.(string); msg != "gincache: redisClient must not be nil" {
+				t.Fatalf("panic 信息 = %v，未指明 client 不能为 nil", recovered)
+			}
+		}()
+		NewTwoLevelStore(nil)
+	})
+
+	t.Run("nil Option 被跳过且负数 TTL 被忽略", func(t *testing.T) {
+		mini := miniredis.RunT(t)
+		client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+		t.Cleanup(func() { _ = client.Close() })
+
+		store := NewTwoLevelStore(client, nil, WithLocalTTL(-time.Second), nil, WithRemoteTTL(-time.Minute))
+		t.Cleanup(func() { _ = store.Close() })
+
+		if store.localTTL != 30*time.Second {
+			t.Fatalf("localTTL = %v, want 30s（负数应被忽略）", store.localTTL)
+		}
+		if store.remoteTTL != 5*time.Minute {
+			t.Fatalf("remoteTTL = %v, want 5m（负数应被忽略）", store.remoteTTL)
+		}
+	})
+}
+
 // staleLocalStore 是一个可控制写入失败、并保留旧值的本地缓存桩。
 type staleLocalStore struct {
 	mu      sync.Mutex
