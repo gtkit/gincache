@@ -5,11 +5,33 @@
 ## [Unreleased]
 
 ### Added
+
+- 新增 `WithCacheableResponse` 与 `CacheableResponse`，用于判定一个已经产生的响应能否被共享缓存；请求期策略跑在 handler 之前，看不到响应头，无法表达这类约束。
+- 新增 `DefaultCacheableResponse`，即未设置 `WithCacheableResponse` 时生效的内置准入基线，可在自定义判据中显式组合。
+
 ### Changed
+
+- **⚠ 破坏性变更**：默认可缓存状态码集合排除 `206 Partial Content`，且携带 `Range` 头的请求整体绕过缓存（既不读也不写）。缓存键不含 `Range`，此前不同范围的请求会互相拿到对方的字节片段。需要缓存 `206` 的调用方可显式配置 `WithCacheableStatusCodes(206)`。
+- **⚠ 破坏性变更**：Handler 调用 `Hijack` 接管连接（WebSocket 升级等）或未写出任何内容时不再产生缓存条目。此前会缓存成一个空 `200`，顶掉后续所有请求。
+- **⚠ 破坏性变更**：连接级 header 不再进入缓存，命中回放时也不再写出——`Connection`、`Proxy-Connection`、`Keep-Alive`、`TE`、`Trailer`、`Transfer-Encoding`、`Upgrade`、`Proxy-Authenticate`、`Proxy-Authorization`，以及 `Connection` 头值中列出的字段名。
+- **⚠ 破坏性变更**：缓存命中回放前会用当前判据复检条目的状态码与响应头，不通过则视为未命中执行 handler。因此升级本身就能挡住此前写入的不合规条目，无需清空 store 或轮换 key 前缀。
+
+### Security
+
+- **⚠ 破坏性变更**：默认拒绝缓存携带 `Set-Cookie`、`Cache-Control: no-store` 或 `Cache-Control: private` 的响应。此前这类响应会被缓存并回放给后续所有请求，等于把第一个用户的会话发给别人。需要恢复旧行为的调用方可传入恒为真的判据：`WithCacheableResponse(func(int, http.Header) bool { return true })`。
+- **⚠ 破坏性变更**：singleflight 把 leader 的响应交给并发等待者之前同样复检。这条路径绕过 store，此前完全不受任何判据保护，leader 的 `Set-Cookie` 会被原样发给所有同 key 的并发等待者。复检不通过时等待者改为执行自己的 handler。
+
+- **⚠ 破坏性变更**：`CacheByRequestURI` 与 `CacheByRequestPath` 的缓存键纳入 HTTP method，键格式变为 `"<method> <uri>"`；`HEAD` 归一为 `GET` 以保留复用 `GET` 条目的能力。此前挂在 `r.Any()` 或混方法路由组下时，`POST` 会复用 `GET` 的响应。升级后旧缓存条目会落空一次，属于一次冷启动。
+- **⚠ 破坏性变更**：`New` 在 store 为 nil 或默认 TTL 为负数时于构造期 panic 并给出明确信息，`opts` 中的 nil 元素被跳过。此前 nil store 要等第一个请求进来才以 nil 解引用的形式暴露。
+- `WithMaxBodySize` 与 `WithSingleFlightForgetTimeout` 忽略负数入参，保持各自"不限制"与"不设定时器"的默认语义。
+
 ### Deprecated
 ### Removed
 ### Fixed
-### Security
+
+- 修复 singleflight 释放定时器从不停止的问题：定时器此前在每个请求上无条件创建且从不 `Stop`，已结束请求的定时器会在后续同 key 请求执行期间调用 `Forget`，导致同一个 key 出现多个 leader、防击穿失效，高 miss 流量下还会持续积累无效定时器。
+- 修复 `TwoLevelStore` 在 Redis 写入成功、L1 写入失败时不清理本地旧值的问题：本实例此前会继续命中过期数据直到本地 TTL 到期，现在会主动失效该 key 的 L1 条目并返回带上下文的错误。
+- `TwoLevelStore.Delete` 与 `DeletePattern` 的本地删除失败不再被静默丢弃，改为经 `WithTwoLevelLogger` 记录；两者的返回值仍然只表达 Redis 的结果。
 
 ## [1.1.0] - 2026-05-28
 

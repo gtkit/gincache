@@ -88,10 +88,11 @@ func TestCacheableResponseBlocksLeakyResponses(t *testing.T) {
 	}
 }
 
-// TestCacheableResponseDefaultsToStatusOnly 钉住不设该选项时行为不变。
+// TestCacheableResponseDefaultsToBaseline 钉住不设该选项时内置基线生效。
 //
-// 这是向后兼容的要求：既有调用方没有这个判据，升级后必须与从前完全一致。
-func TestCacheableResponseDefaultsToStatusOnly(t *testing.T) {
+// 把安全默认做成 opt-in 等于让每个调用方各自记得配置一遍，漏一个就是会话泄漏。
+// 基线只挡 RFC 9111 对共享缓存明确禁止的三类，误伤面接近零。
+func TestCacheableResponseDefaultsToBaseline(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	var calls atomic.Int32
@@ -104,8 +105,6 @@ func TestCacheableResponseDefaultsToStatusOnly(t *testing.T) {
 	))
 	engine.GET("/x", func(c *gin.Context) {
 		calls.Add(1)
-		// 不设判据时，即使带 Set-Cookie 也照旧缓存——这正是引入本选项要修的
-		// 问题，但默认行为必须保持不变，否则升级会静默改变既有调用方的语义。
 		c.Header("Set-Cookie", "session=abc")
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
@@ -114,8 +113,38 @@ func TestCacheableResponseDefaultsToStatusOnly(t *testing.T) {
 		engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
 	}
 
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("handler 被调用 %d 次，want 2（未设判据时内置基线应挡住 Set-Cookie）", got)
+	}
+}
+
+// TestCacheableResponseReplacesBaseline 钉住自定义判据替换而非叠加基线。
+//
+// 叠加会堵死一个合法用法：缓存键已含用户维度时，缓存 private 响应是正确的。
+func TestCacheableResponseReplacesBaseline(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var calls atomic.Int32
+	store := persist.NewMemoryStore(time.Minute)
+	engine := gin.New()
+	engine.Use(Cache(store, time.Minute,
+		WithCacheStrategyByRequest(func(c *gin.Context) (bool, Strategy) {
+			return true, Strategy{CacheKey: c.Request.URL.Path}
+		}),
+		WithCacheableResponse(func(int, http.Header) bool { return true }),
+	))
+	engine.GET("/x", func(c *gin.Context) {
+		calls.Add(1)
+		c.Header("Cache-Control", "private")
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
+
+	for range 2 {
+		engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+	}
+
 	if got := calls.Load(); got != 1 {
-		t.Fatalf("handler 被调用 %d 次，want 1（未设判据时行为应与从前一致）", got)
+		t.Fatalf("handler 被调用 %d 次，want 1（自定义判据应完整替换基线）", got)
 	}
 }
 

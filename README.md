@@ -31,11 +31,13 @@
 - 支持按完整 URI 缓存
 - 支持按路径缓存
 - 支持动态缓存策略
-- 默认只缓存 `2xx`
+- 默认缓存 `2xx`（排除 `206`）
 - 支持自定义可缓存状态码
+- 内置准入基线：默认拒绝缓存 `Set-Cookie`、`Cache-Control: no-store` / `private` 的响应
+- 支持自定义响应期缓存判据，写入、命中回放、singleflight 共享三个时机统一生效
 - 内置 `singleflight` 防击穿
 - 支持响应体大小限制
-- 缓存命中时保留原始响应头（含多值 header）
+- 缓存命中时保留原始响应头（含多值 header），并剔除连接级 header
 - 支持本地缓存 + Redis 的两级缓存
 - 支持通过 `LocalStore` 接口扩展任意 L1 本地缓存
 
@@ -188,6 +190,15 @@ r.GET("/products/:id",
 )
 ```
 
+#### 这两个中间件的缓存键构成
+
+缓存键为 `"<method> <uri>"` 或 `"<method> <path>"`，因此不同 HTTP method 的响应互不复用；
+`HEAD` 归一为 `GET`，可以复用 `GET` 写入的条目。
+
+键中**不含任何请求头**——`Authorization`、Cookie、`Accept-*` 都不在内。按用户区分的响应
+用它们缓存会把第一个用户的内容发给后续所有人，这类接口必须改用下面的
+`Cache + WithCacheStrategyByRequest`，在 `Strategy.CacheKey` 里自行拼入用户维度。
+
 ### 3. `Cache + WithCacheStrategyByRequest`
 
 适合需要动态决定缓存 key、TTL、是否缓存的场景。
@@ -266,7 +277,76 @@ gincache.WithMaxBodySize(1 << 20) // 1MB
 
 自定义允许缓存的状态码。
 
-默认只缓存 `2xx`。
+默认缓存 `2xx`，但排除 `206 Partial Content`——缓存键不含 `Range`，回放会把某一段字节
+连同 `Content-Range` 当成完整响应发给所有人。显式配置优先：你给出的集合会被原样尊重。
+
+### `WithCacheableResponse`
+
+设置响应期缓存判据，判定一个**已经产生的响应**能否被共享。
+
+请求期判据（`WithCacheStrategyByRequest`）跑在 handler 之前，那时响应头还不存在，
+因此无法表达"这个响应不该被共享缓存"。本包会把响应头连同 Body 一起缓存并在命中时
+回放，所以带 `Set-Cookie` 或 `Cache-Control: private` 的响应一旦进了缓存就是会话泄漏。
+
+判据在三个时机被调用，返回 `false` 一律表示"不共享"：
+
+| 时机 | 返回 false 的效果 |
+|------|------------------|
+| 写入缓存前 | 跳过缓存，本次响应照常发给客户端 |
+| 缓存命中回放前 | 视为未命中，继续执行后续 handler |
+| singleflight 把 leader 的响应交给并发等待者前 | 等待者改为执行自己的 handler |
+
+因此判据应保持廉价且无副作用，尤其不要在里面计数或打点——同一次请求可能调用两次。
+传给判据的是 header 的副本，改它不会影响写入 store 或即将回放的内容。
+
+#### 内置基线 `DefaultCacheableResponse`
+
+不设 `WithCacheableResponse` 时，内置基线默认生效，拒绝三类响应：
+
+- 携带任意 `Set-Cookie` 的响应
+- `Cache-Control` 指令中出现 `no-store` 的响应
+- `Cache-Control` 指令中出现 `private` 的响应
+
+指令按逗号切分后逐个比对、大小写不敏感、不做子串匹配，`no-store-hint` 之类的自定义
+指令不会被误判。
+
+`WithCacheableResponse` **替换**基线而不是叠加。替换是为了保留一个合法用法：缓存键里
+已经带了用户维度时，缓存 `Cache-Control: private` 的响应是正确的。需要"基线加上自己的
+条件"时显式组合：
+
+```go
+gincache.WithCacheableResponse(func(status int, header http.Header) bool {
+    return gincache.DefaultCacheableResponse(status, header) &&
+        header.Get("X-No-Cache") == ""
+})
+```
+
+需要恢复"只按状态码判定"的旧行为时，传一个恒为真的判据：
+
+```go
+gincache.WithCacheableResponse(func(int, http.Header) bool { return true })
+```
+
+#### 使用约束：`Vary` 与范围请求
+
+- **`Vary` 不在基线拒绝清单内。** 缓存键不含它列出的请求头，因此响应带 `Vary` 时需要你
+  把对应请求头纳入缓存键（用 `Cache + WithCacheStrategyByRequest` 自己拼键），或者在判据里
+  拒绝它。基线不默认拒绝 `Vary`，是因为 `Vary: Origin` 来自任何 CORS 中间件、
+  `Vary: Accept-Encoding` 来自任何压缩中间件，默认拒绝会把绝大多数项目的命中率打到 0；
+  而它是否真的出错取决于压缩中间件挂在本中间件的外侧还是内侧，这是本包看不到的信息。
+- **携带 `Range` 头的请求整体绕过缓存**，既不读也不写。
+- **Handler 调用 `Hijack` 接管连接后（WebSocket 升级等）不产生缓存条目**，包装器观察不到
+  写入时一律跳过缓存。
+- **连接级 header 不进缓存也不回放**：`Connection`、`Proxy-Connection`、`Keep-Alive`、`TE`、
+  `Trailer`、`Transfer-Encoding`、`Upgrade`、`Proxy-Authenticate`、`Proxy-Authorization`，
+  以及 `Connection` 头值中列出的字段名。
+
+#### 认证响应必须自己拼键
+
+`CacheByRequestURI` 和 `CacheByRequestPath` 的缓存键只有 URI 或 Path，**不含
+`Authorization`、Cookie 或任何其他请求头**。用它们缓存按用户区分的响应会把第一个用户的
+内容发给后续所有人。这类接口必须走 `Cache + WithCacheStrategyByRequest`，在
+`Strategy.CacheKey` 里显式拼进用户维度。
 
 ### `WithDisableSingleFlight`
 

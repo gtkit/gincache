@@ -201,15 +201,25 @@ func (s *TwoLevelStore) SetWithContext(ctx context.Context, key string, value an
 	s.publishInvalidation(ctx, twoLevelInvalidationKey, key)
 
 	if err := s.local.Set(key, value, localExpire); err != nil {
-		return err
+		// 关键动作是失效而不只是报错：Redis 已经是新值，L1 里的旧值若原样留着
+		// 直到 TTL 到期，本实例这段时间读到的一直是旧的。删掉后读取会穿到 Redis。
+		// 删除本身是 best-effort，删也失败时不叠加错误——调用方需要知道的是这次写没成功。
+		if delErr := s.local.Delete(key); delErr != nil {
+			s.logf("gincache: failed to invalidate stale local entry after local set failure key=%q: %v", key, delErr)
+		}
+		return fmt.Errorf("gincache: local cache set failed after remote set succeeded key=%q: %w", key, err)
 	}
 
 	return nil
 }
 
 // Delete 同时删除本地缓存和 Redis 中的单个 key。
+// 返回值表达的是 Redis 的删除结果；本地删除失败只记录日志，不混入返回值。
 func (s *TwoLevelStore) Delete(key string) error {
-	_ = s.local.Delete(key)
+	if err := s.local.Delete(key); err != nil {
+		s.logf("gincache: failed to delete local key=%q: %v", key, err)
+	}
+
 	err := s.remote.Delete(key)
 	if err == nil {
 		s.publishInvalidation(context.Background(), twoLevelInvalidationKey, key)
@@ -218,9 +228,12 @@ func (s *TwoLevelStore) Delete(key string) error {
 }
 
 // DeletePattern 先尽力删除本地缓存，再删除 Redis 中匹配模式的 key。
+// 返回值表达的是 Redis 的删除结果；本地删除失败只记录日志，不混入返回值。
 func (s *TwoLevelStore) DeletePattern(ctx context.Context, pattern string) (int64, error) {
 	if local, ok := s.local.(LocalStoreWithPattern); ok {
-		_, _ = local.DeletePattern(ctx, pattern)
+		if _, err := local.DeletePattern(ctx, pattern); err != nil {
+			s.logf("gincache: failed to delete local pattern=%q: %v", pattern, err)
+		}
 	}
 	n, err := s.remote.DeletePattern(ctx, pattern)
 	if err == nil {
