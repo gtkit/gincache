@@ -15,20 +15,3 @@ build/
 coverage/
 coverage.out
 *.log
-
-# Harness: 本地工具与 Agent 运行产物
-.learnings/
-.openspec-auto-backup/
-.openspec-auto/
-findings.md
-progress.md
-task_plan.md
-.harness/error-journal.md
-.claude/
-.codex/
-.agents/
-AGENTS.md
-CLAUDE.md
-tools/
-.harness/VERSION
-.harness/
