@@ -425,16 +425,26 @@ func (w *cachedWriter) shouldBuffer(nextWriteSize int) bool {
 
 func (m *Middleware) executeHandler(c *gin.Context) *ResponseCache {
 	cw := getWriter(c.Writer, m.cfg.maxBodySize)
-	defer putWriter(cw)
-
 	originalWriter := c.Writer
 	c.Writer = cw
 
+	// **恢复必须先于回收，且两者都必须在 defer 里。**
+	//
+	// 此前的写法是 `defer putWriter(cw)` + 函数末尾赋回 c.Writer：handler panic 时
+	// 末尾那行永远执行不到，而 defer 已经把 cw 的内层 ResponseWriter 置为 nil
+	// 并把它放回了池。于是 gin.Recovery 拿着仍指向 cw 的 c.Writer 写 500 ——
+	// 二次 panic；更糟的是 cw 已回池，可能被另一个请求取走，两个请求共用一个
+	// writer，响应互相串。
+	//
+	// defer 的执行顺序是后进先出，因此这里的单个 defer 内显式排序：
+	// 先把 c.Writer 换回真实 writer（Recovery 从此刻起是安全的），再回收包装器。
+	defer func() {
+		c.Writer = originalWriter
+		putWriter(cw)
+	}()
+
 	// 执行后续 Handler
 	c.Next()
-
-	// 恢复原始 Writer
-	c.Writer = originalWriter
 
 	headers := cloneCachedHeaders(cw.Header())
 
