@@ -5,11 +5,21 @@
 ## [Unreleased]
 
 ### Added
+
+- 缓存命中时评估条件请求：`GET` / `HEAD` 请求的 `If-None-Match` 与 `If-Modified-Since` 与缓存条目的 `ETag` / `Last-Modified` 匹配时返回 `304 Not Modified`，不再发送 Body。`If-None-Match` 优先于 `If-Modified-Since`，比较采用忽略 `W/` 前缀的弱比较，`*` 匹配任何已缓存的表示。多个 `If-None-Match` 字段行会一并评估，含逗号的合法 opaque-tag（如 `"a,b"`）不会被切开。
+
 ### Changed
+
+- **⚠ 破坏性变更**：写入缓存的 TTL 取配置值与响应声明的新鲜期中较小的一个，声明的新鲜期 ≤ 0 时直接拒绝缓存。新鲜期按共享缓存优先级取自 `Cache-Control: s-maxage`、`Cache-Control: max-age`、`Expires` 减 `Date`，并扣除响应已消耗的年龄（`now - Date` 与 `Age` 中较大者），无法解析的 `Expires`（含常见的 `Expires: 0`）按已过期处理。同一新鲜期指令出现多次时取最小值，非法的 delta-seconds（非数字、负数、单边引号）按陈旧处理，超出可表示范围的值钳到最大值。此前 TTL 完全来自中间件配置，handler 声明 `max-age=60` 而中间件配 10 分钟时会回放 10 分钟，`max-age=0`、`s-maxage=0`、已过期的 `Expires` 也照样被缓存回放。`defaultExpire` 与 `Strategy.CacheDuration` 因此是 TTL 上限而不是最终值。
+- **⚠ 破坏性变更**：内置准入基线新增拒绝 `Vary: *` 的响应。按 RFC 9111 §4.1，`Vary: *` 永远匹配失败，该条目不可能被合法复用。具名 `Vary` 维持放行。
+- `TwoLevelStore.Get` 区分 L1 二次命中与 L2 回源，分别计入 `local_hit` 与 `remote_hit`。此前 singleflight 内第二次本地检查命中时仍无条件计入远端命中，并发回填期间会把 L1 命中算成 L2 命中，`local_hit_rate` 因此失真。
+
 ### Deprecated
 ### Removed
 ### Fixed
 ### Security
+
+- **⚠ 破坏性变更**：`DefaultCacheableResponse` 与内置中间件的 `Authorization` 门禁改为大小写无关地读取 header。此前只按规范键查找，`http.Header{"set-cookie": {"x=1"}}` 会被判定为可缓存，请求头里直接写入的小写 `authorization` 也能绕过门禁并让多个请求共享同一份缓存。真实网络流量经 net/http 解析后键必为规范形式，但程序化构造的请求与直接写 map 的 handler 都会踩到。
 
 ## [1.2.0] - 2026-08-10
 

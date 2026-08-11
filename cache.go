@@ -4,8 +4,11 @@ package gincache
 import (
 	"bytes"
 	"context"
+	"errors"
+	"math"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -92,10 +95,12 @@ type Option func(*Config)
 //	Cache-Control: private / no-store / no-cache —— handler 明确声明不可共享缓存；
 //	Vary —— 缓存键不含它列出的请求头，不同 Accept-* 会拿到同一份响应。
 //
-// 前两类由内置基线 DefaultCacheableResponse 默认挡住。Vary 不在基线内：
-// Vary: Origin 来自任何 CORS 中间件、Vary: Accept-Encoding 来自任何压缩中间件，
-// 默认拒绝会把绝大多数调用方的命中率打到 0；而它是否真的出错取决于压缩中间件
-// 挂在本中间件的外侧还是内侧——本包看不到这个信息。需要挡它的调用方自己写判据。
+// 前两类由内置基线 DefaultCacheableResponse 默认挡住，第三类只挡 Vary: *——
+// 它按 RFC 9111 §4.1 永远匹配失败，条目不可能被合法复用，拒绝零误伤。**具名
+// Vary 不在基线内**：Vary: Origin 来自任何 CORS 中间件、Vary: Accept-Encoding
+// 来自任何压缩中间件，默认拒绝会把绝大多数调用方的命中率打到 0；而它是否真的
+// 出错取决于压缩中间件挂在本中间件的外侧还是内侧——本包看不到这个信息。
+// 需要挡具名 Vary 的调用方自己写判据，或把对应请求头纳入缓存键。
 //
 // 判据在三个时机被调用，返回 false 一律表示"不共享"：
 //
@@ -113,9 +118,15 @@ type CacheableResponse func(status int, header http.Header) bool
 
 // DefaultCacheableResponse 是未设置 WithCacheableResponse 时生效的内置准入基线。
 //
-// 它拒绝这些响应：携带任意 Set-Cookie 的响应，以及 Cache-Control 指令中出现
-// no-store、private 或 no-cache 的响应。它们在 RFC 9111 中对共享缓存是明确禁止
-// 或等价禁止的，且几乎不存在合法的共享缓存用途，误伤面接近零。
+// 它拒绝这些响应：携带任意 Set-Cookie 的响应；Cache-Control 指令中出现
+// no-store、private 或 no-cache 的响应；Vary 中出现 * 的响应。它们在 RFC 9111 中
+// 对共享缓存是明确禁止或等价禁止的，且几乎不存在合法的共享缓存用途，误伤面接近零。
+//
+// Vary: * 按 RFC 9111 §4.1 永远匹配失败，条目不可能被合法复用。**具名 Vary 不在
+// 拒绝清单内**，理由见 CacheableResponse 的说明。
+//
+// 判定大小写无关，也不会修改传入的 header——本函数是导出的组合原语，调用方
+// 可能传进直接写 map 得到的非规范键，而那份 header 往往还要接着用。
 //
 // no-cache 的语义是"未经重新验证不得复用"而非"不得存储"。本包没有 revalidation
 // 机制，存了就必然无验证复用——"允许存储"这一半没有任何可利用的余地，因此对
@@ -131,21 +142,214 @@ type CacheableResponse func(status int, header http.Header) bool
 //		return gincache.DefaultCacheableResponse(status, header) && myCheck(status, header)
 //	})
 func DefaultCacheableResponse(_ int, header http.Header) bool {
-	if len(header.Values("Set-Cookie")) > 0 {
-		return false
-	}
-
-	for _, value := range header.Values("Cache-Control") {
-		for directive := range strings.SplitSeq(value, ",") {
-			name, _, _ := strings.Cut(directive, "=")
-			switch strings.ToLower(strings.TrimSpace(name)) {
-			case "no-store", "private", "no-cache":
+	// 一趟扫描而不是逐个 header 做 map 查找：本函数要看三个头，而最常见的情况是
+	// 三个都不存在——"先查规范键、查不到再全表扫描"反而让常见情况每次都扫全表。
+	// 一趟扫描顺带对非规范键天然正确（本函数是导出的组合原语，调用方可能传进
+	// 直接写 map 得到的键）。
+	for key, values := range header {
+		switch {
+		case strings.EqualFold(key, "Set-Cookie"):
+			if len(values) > 0 {
+				return false
+			}
+		case strings.EqualFold(key, "Vary"):
+			if hasVaryStar(values) {
+				return false
+			}
+		case strings.EqualFold(key, "Cache-Control"):
+			if parseCacheControl(values).blocked {
 				return false
 			}
 		}
 	}
 
 	return true
+}
+
+// responseFreshness 解析响应自己声明的新鲜期。
+//
+// 优先级按 RFC 9111 §4.2.1：s-maxage（只对共享缓存生效）> max-age > Expires - Date。
+// 存在 Expires 但无法解析时按已过期处理——RFC 9111 §5.3 要求把非法日期（尤其是
+// 常见的 "Expires: 0"）当作过去的时间。
+//
+// 第二个返回值表示响应是否声明过新鲜期；未声明时调用方沿用配置的 TTL。
+func responseFreshness(header http.Header) (time.Duration, bool) {
+	var (
+		control                     cacheControlView
+		expiresRaw, dateRaw, ageRaw string
+	)
+
+	for key, values := range header {
+		switch {
+		case strings.EqualFold(key, "Cache-Control"):
+			control = parseCacheControl(values)
+		case strings.EqualFold(key, "Expires"):
+			if len(values) > 0 {
+				expiresRaw = values[0]
+			}
+		case strings.EqualFold(key, "Date"):
+			if len(values) > 0 {
+				dateRaw = values[0]
+			}
+		case strings.EqualFold(key, "Age"):
+			if len(values) > 0 {
+				ageRaw = values[0]
+			}
+		}
+	}
+
+	// Date 缺失时以"收到响应的时刻"为准，也就是现在（RFC 9111 §4.2.1）。
+	//
+	// 先判空再解析：http.ParseTime 会依次尝试三种格式，每次失败都分配一个
+	// *time.ParseError——本地 handler 的响应通常没有 Date，不该在命中热路径上白付。
+	now := time.Now()
+	date := now
+	if dateRaw != "" {
+		if parsed, err := http.ParseTime(dateRaw); err == nil {
+			date = parsed
+		}
+	}
+
+	var lifetime time.Duration
+	switch {
+	case control.hasFreshness:
+		lifetime = control.freshness
+	case expiresRaw == "":
+		return 0, false
+	default:
+		expiresAt, err := http.ParseTime(expiresRaw)
+		if err != nil {
+			return -1, true
+		}
+		lifetime = expiresAt.Sub(date)
+	}
+
+	// 扣掉响应已经消耗掉的新鲜期（RFC 9111 §4.2.3 的 current_age）。
+	//
+	// 本地 handler 产生的响应没有 Age、Date 就是当下，这一项为 0，行为不受影响；
+	// 只有 handler 在做上游代理并透传了这两个头时才起作用——那时上游的
+	// "max-age=60, Age: 60" 已经是陈旧响应，不扣就等于又给它续了 60 秒。
+	currentAge := max(now.Sub(date), 0)
+	// 同样先判空：strconv.ParseInt 对空串会分配一个 *strconv.NumError。
+	if ageRaw != "" {
+		if age, ok := parseDeltaSeconds(ageRaw); ok {
+			currentAge = max(currentAge, age)
+		}
+	}
+
+	return lifetime - currentAge, true
+}
+
+// maxDeltaSeconds 是 time.Duration 还能表示的最大秒数。
+const maxDeltaSeconds = int64(math.MaxInt64) / int64(time.Second)
+
+// parseDeltaSeconds 解析 delta-seconds 参数（Cache-Control 的 max-age 系列与 Age）。
+//
+// 第二个返回值为 false 表示值非法：非数字、负数，或者带单边引号——delta-seconds
+// 是非负整数，这些都不该被当成有效的新鲜期。
+//
+// 超出可表示范围时钳到最大值而不是判为非法，这是 RFC 9111 §1.2.2 的要求；
+// 反正最终 TTL 还要与配置值取小，钳到多大都不会真的放宽缓存。
+func parseDeltaSeconds(param string) (time.Duration, bool) {
+	value := unquote(param)
+
+	seconds, err := strconv.ParseInt(value, 10, 64)
+	switch {
+	case errors.Is(err, strconv.ErrRange) && !strings.HasPrefix(value, "-"):
+		return time.Duration(math.MaxInt64), true
+	case err != nil, seconds < 0:
+		return 0, false
+	case seconds > maxDeltaSeconds:
+		return time.Duration(math.MaxInt64), true
+	}
+
+	return time.Duration(seconds) * time.Second, true
+}
+
+// unquote 去掉成对的双引号。单边引号保持原样，好让它在后续解析中被判为非法，
+// 而不是被 strings.Trim 悄悄抹平成一个合法数字。
+func unquote(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 && strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`) {
+		return value[1 : len(value)-1]
+	}
+	return value
+}
+
+// hasVaryStar 报告 Vary 是否包含 "*"。
+func hasVaryStar(values []string) bool {
+	for _, value := range values {
+		for field := range strings.SplitSeq(value, ",") {
+			if strings.TrimSpace(field) == "*" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// cacheControlView 是一次 Cache-Control 扫描能得到的全部判定结果。
+//
+// 合成一个按值返回的结构体，而不是返回 iter.Seq2 迭代器：迭代器要分配闭包，
+// 而准入判定与新鲜期解析都在缓存命中的热路径上，两处各一次分配是白付的。
+type cacheControlView struct {
+	// blocked 表示出现了 no-store / private / no-cache 之一。
+	blocked bool
+	// freshness 是声明的新鲜期，hasFreshness 表示是否声明过。
+	freshness    time.Duration
+	hasFreshness bool
+}
+
+// parseCacheControl 扫描 Cache-Control 的全部值，一趟得出准入与新鲜期两项判定。
+func parseCacheControl(values []string) cacheControlView {
+	var (
+		view                  cacheControlView
+		sMaxAge, maxAge       time.Duration
+		hasSMaxAge, hasMaxAge bool
+	)
+
+	for _, value := range values {
+		for directive := range strings.SplitSeq(value, ",") {
+			name, param, _ := strings.Cut(directive, "=")
+			switch strings.ToLower(strings.TrimSpace(name)) {
+			case "no-store", "private", "no-cache":
+				view.blocked = true
+			case "s-maxage":
+				sMaxAge, hasSMaxAge = mergeFreshness(sMaxAge, hasSMaxAge, param)
+			case "max-age":
+				maxAge, hasMaxAge = mergeFreshness(maxAge, hasMaxAge, param)
+			}
+		}
+	}
+
+	// s-maxage 只对共享缓存生效，优先级高于 max-age。
+	switch {
+	case hasSMaxAge:
+		view.freshness, view.hasFreshness = sMaxAge, true
+	case hasMaxAge:
+		view.freshness, view.hasFreshness = maxAge, true
+	}
+
+	return view
+}
+
+// mergeFreshness 把同一个新鲜期指令的又一次出现并入已有结果，取更保守的那个。
+//
+// RFC 9111 §4.2.1 对重复指令允许"取首个或按陈旧处理"。这里取最小值：它对两种
+// 出现顺序给出同样保守的结果，而取首个会让 "max-age=600, max-age=0" 仍然缓存
+// 600 秒——同一份响应只因指令先后不同就差出十分钟，不是共享缓存该有的行为。
+//
+// 值非法时按陈旧处理（RFC 9111 §1.2.2），而不是把整条指令当作没出现——后者
+// 会退回配置的 TTL，等于让一个写错的 max-age 反而放宽了缓存。
+func mergeFreshness(current time.Duration, has bool, param string) (time.Duration, bool) {
+	parsed, ok := parseDeltaSeconds(param)
+	if !ok {
+		return 0, true
+	}
+	if !has {
+		return parsed, true
+	}
+	return min(current, parsed), true
 }
 
 // WithCacheableResponse 设置响应期缓存判据，**替换**内置基线 DefaultCacheableResponse。
@@ -324,7 +528,20 @@ func cacheableRequest(r *http.Request) bool {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return false
 	}
-	return r.Header.Get("Authorization") == ""
+	return !hasHeaderFold(r.Header, "Authorization")
+}
+
+// hasHeaderFold 大小写无关地报告 header 中是否存在某个字段。
+//
+// 真实网络流量经 net/http 解析后键必为规范形式，但程序化构造的请求（测试、
+// 内部中间件、网关适配层）可能留下非规范键——只按规范键查找会让门禁被绕过。
+func hasHeaderFold(header http.Header, name string) bool {
+	for key, values := range header {
+		if len(values) > 0 && strings.EqualFold(key, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // requestKey 把 method 拼进缓存键。不含 method 的键会让挂在 r.Any() 或混方法
@@ -682,6 +899,22 @@ func (m *Middleware) cacheResponse(key string, resp *ResponseCache, store persis
 		return
 	}
 
+	// 响应自己声明的新鲜期约束回放时长：声明已经过期就不该进缓存，声明比配置短
+	// 就以声明为准。配置 TTL 因此是上限，而不是最终值。
+	if declared, ok := responseFreshness(resp.Headers); ok {
+		if declared <= 0 {
+			if m.cfg.logger != nil {
+				m.cfg.logger.Debugf("gincache: response declares no freshness lifetime, skip cache")
+			}
+			return
+		}
+		// duration 为 0 表示交由存储决定，此时直接用声明值——min(0, 声明) 会退化
+		// 成 0 并被存储当成默认值，反而可能更长。
+		if duration <= 0 || declared < duration {
+			duration = declared
+		}
+	}
+
 	// 写入缓存
 	// 使用独立于请求的 context，避免客户端取消导致缓存回填中断。
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -720,6 +953,13 @@ func (m *Middleware) replayable(resp *ResponseCache) (http.Header, bool) {
 	if !m.statusCacheable(resp.Status) || !m.responseCacheable(resp.Status, header) {
 		return nil, false
 	}
+
+	// 升级前写入的条目可能声明了一出生就过期的新鲜期，回放前一并挡下。
+	// 这里判定的是条目声明的新鲜期本身，条目是否已经到期由存储的 TTL 负责。
+	if declared, ok := responseFreshness(header); ok && declared <= 0 {
+		return nil, false
+	}
+
 	return header, true
 }
 
@@ -755,12 +995,124 @@ func (m *Middleware) writeResponse(c *gin.Context, resp *ResponseCache, header h
 	applyCachedHeaders(c.Writer.Header(), header)
 	c.Header("X-Cache", "HIT")
 
+	if notModified(c.Request, resp.Status, header) {
+		writeNotModified(c)
+		return
+	}
+
 	c.Status(resp.Status)
 	if c.Request.Method == http.MethodHead || len(resp.Body) == 0 {
 		c.Writer.WriteHeaderNow()
 		return
 	}
 	_, _ = c.Writer.Write(resp.Body)
+}
+
+// notModified 报告缓存条目对本次条件请求可以答以 304。
+//
+// 只对 200 条目和 GET / HEAD 生效：其他状态码的 304 没有意义，其他方法的条件
+// 请求语义是 412 而不是 304，本包不涉足。
+func notModified(r *http.Request, status int, header http.Header) bool {
+	if status != http.StatusOK {
+		return false
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		return false
+	}
+
+	// If-None-Match 优先于 If-Modified-Since（RFC 9110 §13.2.2）：前者存在时，
+	// 后者一律不再评估，哪怕前者不匹配。
+	//
+	// 用 Values 而不是 Get：多个字段行等价于逗号连接的一个列表，Get 只会给出
+	// 第一行，后面几行里的 tag 就漏掉了。
+	ifNoneMatch := r.Header.Values("If-None-Match")
+	for _, line := range ifNoneMatch {
+		if strings.TrimSpace(line) != "" {
+			return etagMatches(ifNoneMatch, header.Get("ETag"))
+		}
+	}
+
+	// 先判空再解析：http.ParseTime 会依次尝试三种格式，每次失败都分配一个
+	// *time.ParseError——绝大多数请求不带这个头，不该在命中热路径上白付三次分配。
+	ifModifiedSince := r.Header.Get("If-Modified-Since")
+	if ifModifiedSince == "" {
+		return false
+	}
+
+	since, err := http.ParseTime(ifModifiedSince)
+	if err != nil {
+		return false
+	}
+	modified, err := http.ParseTime(header.Get("Last-Modified"))
+	if err != nil {
+		return false
+	}
+	// HTTP 日期精度只到秒，不晚于即视为未变更。
+	return !modified.Truncate(time.Second).After(since)
+}
+
+// etagMatches 按 RFC 9110 §13.1.2 的弱比较判断 If-None-Match 是否命中。
+// 弱比较忽略 W/ 前缀；"*" 表示"只要存在表示就算命中"。
+func etagMatches(ifNoneMatch []string, etag string) bool {
+	want := strings.TrimPrefix(etag, "W/")
+
+	for _, line := range ifNoneMatch {
+		for rest := line; rest != ""; {
+			var candidate string
+			candidate, rest = nextEntityTag(rest)
+
+			switch {
+			case candidate == "":
+				continue
+			case candidate == "*":
+				return true
+			case etag != "" && strings.TrimPrefix(candidate, "W/") == want:
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// nextEntityTag 从 If-None-Match 列表里切出下一个 entity-tag 及剩余部分。
+//
+// 不能直接按逗号切分：合法的 opaque-tag 允许包含逗号（`"a,b"` 是一个 tag 而不是
+// 两个），引号内的逗号不是分隔符。
+func nextEntityTag(list string) (tag, rest string) {
+	list = strings.TrimLeft(list, " \t,")
+	if list == "" {
+		return "", ""
+	}
+
+	inQuotes := false
+	for i := range len(list) {
+		switch list[i] {
+		case '"':
+			inQuotes = !inQuotes
+		case ',':
+			if !inQuotes {
+				return strings.TrimSpace(list[:i]), list[i+1:]
+			}
+		}
+	}
+
+	return strings.TrimSpace(list), ""
+}
+
+// writeNotModified 写出 304 并剔除与实体相关的 header，与 net/http 自己的
+// writeNotModified 保持一致。
+func writeNotModified(c *gin.Context) {
+	header := c.Writer.Header()
+	header.Del("Content-Type")
+	header.Del("Content-Length")
+	header.Del("Content-Encoding")
+	if header.Get("ETag") != "" {
+		header.Del("Last-Modified")
+	}
+
+	c.Status(http.StatusNotModified)
+	c.Writer.WriteHeaderNow()
 }
 
 func cloneCachedHeaders(src http.Header) http.Header {

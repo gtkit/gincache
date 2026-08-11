@@ -53,7 +53,16 @@ func TestDefaultCacheableResponse(t *testing.T) {
 		{"public 放行", http.Header{"Cache-Control": {"public, max-age=60"}}, true},
 		{"指令名不做子串匹配", http.Header{"Cache-Control": {"no-store-hint=1"}}, true},
 		{"privately 不误判", http.Header{"Cache-Control": {"privately"}}, true},
-		{"Vary 放行", http.Header{"Vary": {"Accept-Encoding"}}, true},
+		{"具名 Vary 放行", http.Header{"Vary": {"Accept-Encoding"}}, true},
+		// Vary: * 按 RFC 9111 §4.1 永远匹配失败，条目不可能被合法复用。
+		{"Vary 星号拒绝", http.Header{"Vary": {"*"}}, false},
+		{"Vary 列表含星号拒绝", http.Header{"Vary": {"Origin, *"}}, false},
+		{"多个 Vary 头含星号拒绝", http.Header{"Vary": {"Origin", "*"}}, false},
+		// 本函数是导出的组合原语，调用方可能传进直接写 map 得到的非规范键。
+		{"非规范键 set-cookie 拒绝", http.Header{"set-cookie": {"x=1"}}, false},
+		{"非规范键 cache-control 拒绝", http.Header{"cache-control": {"no-store"}}, false},
+		{"非规范键 vary 星号拒绝", http.Header{"vary": {"*"}}, false},
+		{"非规范键常规响应放行", http.Header{"content-type": {"text/plain"}}, true},
 	}
 
 	for _, tt := range tests {
@@ -62,6 +71,53 @@ func TestDefaultCacheableResponse(t *testing.T) {
 				t.Fatalf("DefaultCacheableResponse = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestDefaultCacheableResponseDoesNotMutateInput 钉住基线不修改传入的 header。
+//
+// 它是导出的组合原语，调用方传进来的 header 往往还要接着用。
+func TestDefaultCacheableResponseDoesNotMutateInput(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// 用变量做键，避免在 http.Header 上写非规范的字面量索引。
+	rawKey := "set-cookie"
+	header := http.Header{
+		rawKey:         {"x=1"},
+		"Content-Type": {"text/plain"},
+	}
+
+	DefaultCacheableResponse(http.StatusOK, header)
+
+	if len(header) != 2 {
+		t.Fatalf("header 条目数 = %d, want 2：入参被改动了", len(header))
+	}
+	if got := header[rawKey]; len(got) != 1 || got[0] != "x=1" {
+		t.Fatalf("非规范键被改写：%v", header)
+	}
+}
+
+// TestVaryStarNotCached 钉住 Vary: * 的响应不进缓存。
+func TestVaryStarNotCached(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var calls atomic.Int32
+	store := persist.NewMemoryStore(time.Minute)
+	t.Cleanup(func() { _ = store.Close() })
+
+	engine := admissionEngine(store)
+	engine.GET("/x", func(c *gin.Context) {
+		calls.Add(1)
+		c.Header("Vary", "*")
+		c.String(http.StatusOK, "ok")
+	})
+
+	for range 2 {
+		engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+	}
+
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("handler 被调用 %d 次，want 2：Vary: * 的响应被缓存了", got)
 	}
 }
 

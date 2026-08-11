@@ -222,6 +222,29 @@ func TestAuthorizedRequestBypassesBuiltinCache(t *testing.T) {
 		}
 	})
 
+	t.Run("非规范键的 authorization 同样绕过", func(t *testing.T) {
+		var calls atomic.Int32
+		store := persist.NewMemoryStore(time.Minute)
+		t.Cleanup(func() { _ = store.Close() })
+		router := newRouter(store, &calls)
+
+		// 直接写 map，绕过 Header.Set 的规范化——真实流量不会这样，
+		// 但测试、内部中间件、网关适配层都可能这样构造请求。
+		for range 2 {
+			req := httptest.NewRequest(http.MethodGet, "/me", nil)
+			req.Header["authorization"] = []string{"Bearer token-a"}
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if got := rec.Header().Get("X-Cache"); got == "HIT" {
+				t.Fatal("非规范键的 authorization 绕过了门禁并命中了共享缓存")
+			}
+		}
+
+		if got := calls.Load(); got != 2 {
+			t.Fatalf("handler 被调用 %d 次，want 2", got)
+		}
+	})
+
 	t.Run("不写缓存", func(t *testing.T) {
 		var calls atomic.Int32
 		store := persist.NewMemoryStore(time.Minute)

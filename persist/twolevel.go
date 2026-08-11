@@ -160,7 +160,7 @@ func (s *TwoLevelStore) Get(key string, value any) error {
 
 		var temp json.RawMessage
 		if err := s.local.Get(key, &temp); err == nil {
-			return temp, nil
+			return twoLevelResult{data: temp, fromLocal: true}, nil
 		}
 
 		var data json.RawMessage
@@ -171,27 +171,33 @@ func (s *TwoLevelStore) Get(key string, value any) error {
 
 		_ = s.local.Set(key, data, s.localTTL)
 
-		return []byte(data), nil
+		return twoLevelResult{data: data}, nil
 	})
 	if err != nil {
 		s.miss.Add(1)
 		return err
 	}
 
-	s.remoteHit.Add(1)
-
-	switch v := result.(type) {
-	case []byte:
-		return json.Unmarshal(v, value)
-	case json.RawMessage:
-		return json.Unmarshal(v, value)
-	default:
-		data, err := json.Marshal(v)
-		if err != nil {
-			return fmt.Errorf("gincache: unexpected singleflight result type %T: %w", v, err)
-		}
-		return json.Unmarshal(data, value)
+	got, ok := result.(twoLevelResult)
+	if !ok {
+		return fmt.Errorf("gincache: unexpected singleflight result type %T", result)
 	}
+
+	// 按实际来源计数。等待者与 leader 记为同一来源——他们拿到的确实是同一份
+	// 数据、同一个来源；无条件计入远端会把并发回填期间的 L1 命中算成 L2 命中。
+	if got.fromLocal {
+		s.localHit.Add(1)
+	} else {
+		s.remoteHit.Add(1)
+	}
+
+	return json.Unmarshal(got.data, value)
+}
+
+// twoLevelResult 承载一次 singleflight 回源的结果及其命中来源。
+type twoLevelResult struct {
+	data      json.RawMessage
+	fromLocal bool
 }
 
 // Set 先写 Redis，成功后再写本地缓存。

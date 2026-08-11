@@ -9,9 +9,6 @@ credentials.*
 .Ds_Store
 .idea/
 .vscode/
-bin/
-dist/
-build/
 coverage/
 coverage.out
 *.log

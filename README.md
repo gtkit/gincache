@@ -34,7 +34,9 @@
 - 内置中间件只缓存 `GET` / `HEAD`，并绕过携带 `Authorization` 的请求
 - 默认缓存 `2xx`（排除 `206`）
 - 支持自定义可缓存状态码
-- 内置准入基线：默认拒绝缓存 `Set-Cookie`、`Cache-Control: no-store` / `private` / `no-cache` 的响应
+- 内置准入基线：默认拒绝缓存 `Set-Cookie`、`Cache-Control: no-store` / `private` / `no-cache`、`Vary: *` 的响应
+- 写入 TTL 受响应声明的新鲜期约束（`s-maxage` / `max-age` / `Expires`），配置的 TTL 是上限
+- 缓存命中时按 `If-None-Match` / `If-Modified-Since` 返回 `304`
 - 支持自定义响应期缓存判据，写入、命中回放、singleflight 共享三个时机统一生效
 - 内置 `singleflight` 防击穿
 - 支持响应体大小限制
@@ -319,6 +321,7 @@ gincache.WithMaxBodySize(1 << 20) // 1MB
 - `Cache-Control` 指令中出现 `no-store` 的响应
 - `Cache-Control` 指令中出现 `private` 的响应
 - `Cache-Control` 指令中出现 `no-cache` 的响应
+- `Vary` 中出现 `*` 的响应
 
 指令按逗号切分后逐个比对、大小写不敏感、不做子串匹配，`no-store-hint` 之类的自定义
 指令不会被误判。
@@ -348,11 +351,47 @@ gincache.WithCacheableResponse(func(status int, header http.Header) bool {
 gincache.WithCacheableResponse(func(int, http.Header) bool { return true })
 ```
 
-#### 使用约束：`Vary` 与范围请求
+注意：**响应声明的新鲜期不受这个判据影响**（见下节）。判据表达的是"这个响应能不能
+共享"，是你的策略；新鲜期表达的是"能共享多久"，是响应自己的声明，两者正交。
 
-- **`Vary` 不在基线拒绝清单内。** 缓存键不含它列出的请求头，因此响应带 `Vary` 时需要你
-  把对应请求头纳入缓存键（用 `Cache + WithCacheStrategyByRequest` 自己拼键），或者在判据里
-  拒绝它。基线不默认拒绝 `Vary`，是因为 `Vary: Origin` 来自任何 CORS 中间件、
+#### 配置的 TTL 是上限
+
+写入缓存使用的 TTL 取**配置值与响应声明的新鲜期中较小的一个**。新鲜期按共享缓存的
+优先级依次取自 `Cache-Control: s-maxage`、`Cache-Control: max-age`、`Expires` 减 `Date`。
+
+因此 `defaultExpire` 与 `Strategy.CacheDuration` 是 TTL 上限而不是最终值——handler 声明
+`Cache-Control: max-age=60` 时，即使中间件配了 10 分钟，条目也只缓存 60 秒。
+
+新鲜期还会**扣除响应已经消耗掉的部分**（RFC 9111 §4.2.3 的 `current_age`，取 `now - Date`
+与 `Age` 中较大者）。本地 handler 产生的响应没有 `Age`、`Date` 就是当下，这一项为 0；
+只有 handler 在做上游代理并透传这两个头时才起作用——上游的 `max-age=60, Age: 60`
+已经是陈旧响应，不扣就等于又给它续了 60 秒。
+
+声明的新鲜期 ≤ 0 时**直接拒绝缓存**，这覆盖 `max-age=0`、`s-maxage=0`、已过期的 `Expires`，
+以及无法解析的 `Expires`（含常见的 `Expires: 0`，按 RFC 9111 §5.3 视为过去时间）。
+响应未声明新鲜期时，完全沿用配置的 TTL。
+
+指令解析取保守值：同一个新鲜期指令出现多次时取**最小值**（`max-age=600, max-age=0` 与
+`max-age=0, max-age=600` 都判为陈旧）；非法的 delta-seconds（非数字、负数、单边引号）
+按陈旧处理而不是当作没出现；超出可表示范围的值钳到最大值，最终仍与配置 TTL 取小。
+
+#### 条件请求返回 304
+
+缓存命中且条目为 `200` 时，`GET` / `HEAD` 请求的 `If-None-Match` 与 `If-Modified-Since`
+会被评估，匹配则返回 `304 Not Modified` 且不发送 Body。`If-None-Match` 优先于
+`If-Modified-Since`，比较采用弱比较（忽略 `W/` 前缀），`*` 匹配任何已缓存的表示。
+多个 `If-None-Match` 字段行等价于一个列表，会一并评估；含逗号的合法 opaque-tag
+（如 `"a,b"`）不会被当成两个 tag 切开。
+
+`304` 响应不含 `Content-Type`、`Content-Length`、`Content-Encoding`；条目带 `ETag` 时也
+不含 `Last-Modified`。其余缓存的响应头照常写出，`X-Cache: HIT` 保留。
+
+#### 使用约束：具名 `Vary` 与范围请求
+
+- **具名 `Vary` 不在基线拒绝清单内**（`Vary: *` 已默认拒绝）。缓存键不含它列出的请求头，
+  因此响应带具名 `Vary` 时需要你把对应请求头纳入缓存键（用
+  `Cache + WithCacheStrategyByRequest` 自己拼键），或者在判据里拒绝它。基线不默认拒绝具名
+  `Vary`，是因为 `Vary: Origin` 来自任何 CORS 中间件、
   `Vary: Accept-Encoding` 来自任何压缩中间件，默认拒绝会把绝大多数项目的命中率打到 0；
   而它是否真的出错取决于压缩中间件挂在本中间件的外侧还是内侧，这是本包看不到的信息。
 - **携带 `Range` 头的请求整体绕过缓存**，既不读也不写。
@@ -393,12 +432,6 @@ gincache.WithCacheStrategyByRequest(func(c *gin.Context) (bool, gincache.Strateg
     return true, gincache.Strategy{CacheKey: c.Request.URL.Path}
 })
 ```
-
-#### 条件请求不产生 304
-
-客户端带 `If-None-Match` 或 `If-Modified-Since` 时，缓存命中会回放完整的 `200` 响应
-（包含原始的 `ETag` / `Last-Modified`），而不是 `304 Not Modified`。响应内容是正确的，
-代价是多一份 Body 的带宽。
 
 ### `WithDisableSingleFlight`
 

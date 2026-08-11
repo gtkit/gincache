@@ -116,6 +116,57 @@ func TestTwoLevelStoreLogsLocalDeleteFailure(t *testing.T) {
 	}
 }
 
+// TestTwoLevelStoreCountsHitSource 钉住命中来源统计区分 L1 与 L2。
+//
+// singleflight 内第二次本地检查命中时，此前仍无条件计入 remoteHit，
+// 并发回填期间的 L1 命中会被算成 L2 命中，local_hit_rate 因此失真。
+func TestTwoLevelStoreCountsHitSource(t *testing.T) {
+	t.Parallel()
+
+	mini := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+
+	local := newStaleLocalStore()
+	store := NewTwoLevelStore(client,
+		WithLocalTTL(time.Minute),
+		WithRemoteTTL(time.Minute),
+		WithLocalStore(local),
+	)
+	t.Cleanup(func() { _ = store.Close() })
+
+	// 只写 Redis，让 L1 保持为空，第一次读必然回源。
+	if err := store.RemoteStore().Set("route:/products", map[string]any{"v": 1}, time.Minute); err != nil {
+		t.Fatalf("remote Set error: %v", err)
+	}
+
+	var got map[string]any
+	if err := store.Get("route:/products", &got); err != nil {
+		t.Fatalf("Get error: %v", err)
+	}
+	if stats := store.Stats(); stats["remote_hit"] != 1 || stats["local_hit"] != 0 {
+		t.Fatalf("回源后 remote_hit=%d local_hit=%d, want 1/0", stats["remote_hit"], stats["local_hit"])
+	}
+
+	// 回源时已回填 L1，第二次读走最外层的本地命中。
+	if err := store.Get("route:/products", &got); err != nil {
+		t.Fatalf("Get error: %v", err)
+	}
+	if stats := store.Stats(); stats["remote_hit"] != 1 || stats["local_hit"] != 1 {
+		t.Fatalf("本地命中后 remote_hit=%d local_hit=%d, want 1/1", stats["remote_hit"], stats["local_hit"])
+	}
+
+	// 构造 singleflight 内的第二次本地检查命中：最外层读不到、内层读得到。
+	store.ResetStats()
+	local.failNextGet()
+	if err := store.Get("route:/products", &got); err != nil {
+		t.Fatalf("Get error: %v", err)
+	}
+	if stats := store.Stats(); stats["local_hit"] != 1 || stats["remote_hit"] != 0 {
+		t.Fatalf("singleflight 内本地命中后 local_hit=%d remote_hit=%d, want 1/0", stats["local_hit"], stats["remote_hit"])
+	}
+}
+
 // TestNewTwoLevelStoreValidatesConfiguration 钉住配置错误在构造期而不是首次读写时暴露。
 func TestNewTwoLevelStoreValidatesConfiguration(t *testing.T) {
 	t.Parallel()
@@ -152,10 +203,11 @@ func TestNewTwoLevelStoreValidatesConfiguration(t *testing.T) {
 
 // staleLocalStore 是一个可控制写入失败、并保留旧值的本地缓存桩。
 type staleLocalStore struct {
-	mu      sync.Mutex
-	values  map[string][]byte
-	setErr  error
-	deletes int
+	mu       sync.Mutex
+	values   map[string][]byte
+	setErr   error
+	deletes  int
+	skipNext bool
 }
 
 func newStaleLocalStore() *staleLocalStore {
@@ -192,8 +244,21 @@ func (s *staleLocalStore) deleteCount() int {
 	return s.deletes
 }
 
+// failNextGet 让下一次 Get 谎报未命中，用于构造"最外层读不到、singleflight
+// 内层读得到"这条路径。
+func (s *staleLocalStore) failNextGet() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.skipNext = true
+}
+
 func (s *staleLocalStore) Get(key string, value any) error {
 	s.mu.Lock()
+	if s.skipNext {
+		s.skipNext = false
+		s.mu.Unlock()
+		return ErrCacheMiss
+	}
 	data, ok := s.values[key]
 	s.mu.Unlock()
 	if !ok {
