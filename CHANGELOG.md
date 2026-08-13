@@ -5,6 +5,15 @@
 ## [Unreleased]
 
 ### Added
+### Changed
+### Deprecated
+### Removed
+### Fixed
+### Security
+
+## [1.3.0] - 2026-08-13
+
+### Added
 
 - 缓存命中时评估条件请求：`GET` / `HEAD` 请求的 `If-None-Match` 与 `If-Modified-Since` 与缓存条目的 `ETag` / `Last-Modified` 匹配时返回 `304 Not Modified`，不再发送 Body。`If-None-Match` 只要存在就压制 `If-Modified-Since`（即使值为空或不匹配），比较采用忽略 `W/` 前缀的弱比较，`*` 匹配任何已缓存的表示。多个 `If-None-Match` 字段行会一并评估，含逗号的合法 opaque-tag（如 `"a,b"`）不会被切开；重复的 `If-Modified-Since` 属畸形请求，整体忽略。
 - 缓存命中回放时写出 `Age`，表示该响应自源站生成以来的秒数（RFC 9111 §5.1）。只扣减本级 TTL 不足以保护下游——下游的 CDN 或浏览器看到偏小的 `Age` 会把这份响应再多留一段时间。`ResponseCache` 为此新增 `ResponseTime`（收到响应的时刻）与 `InitialAge`（响应到达时已有的年龄）两个字段。本包此前写入的条目没有它们：既无 `ResponseTime` 也无 `Date` 时年龄无从估算，这类条目按未命中处理并由 handler 重新产生响应回填，每个键只需一次回源且被 singleflight 合并。
@@ -21,8 +30,6 @@
 - **⚠ 破坏性变更**：以下构造入口改为在构造期拒绝 nil（含装进接口的 typed-nil），不再把 nil 解引用推迟到第一次读写——`persist.NewRedisStore` 的 `client`、`persist.NewTwoLevelStore` 的 `redisClient`、`persist.WithLocalStore` 的 `local`、`ristrettoadapter.New` 的 `cache`、`ristrettoadapter.WithCost` 的成本函数。被拦下的程序原本必然崩在首次读写，迁移方式是传入非 nil 依赖。其中 `ristrettoadapter.New(nil)` 原本**不会崩**：Ristretto 的方法对 nil receiver 安全，它会静默变成黑洞缓存——每次 `Set` 返回 `nil` 装作写成功，每次 `Get` 返回未命中；这类静默失效现在改为显式报错。
 - **⚠ 破坏性变更**：`persist.WithLocalTTL(0)` 由静默接受改为在 `NewTwoLevelStore` 构造时 panic。`localTTL` 是 L1 的陈旧上限，取 0 会让本地条目永不过期、也永不被后台清理回收：Redis 条目过期后该实例永久返回旧值，L1 同时失去唯一的回收机制、内存只增不减。迁移方式二选一——想用默认的 30 秒就省略 `WithLocalTTL`，需要别的值就传正数。负数入参的语义不变（忽略，保持默认值）。
 
-### Deprecated
-### Removed
 ### Fixed
 
 - 修复新鲜期计算在极端日期下的整数回绕：`Time.Sub` 超过约 292 年会饱和到 `MinInt64` / `MaxInt64`，两个饱和值相减恰好绕成 `+1ns`，几百年前就过期的响应会被判成新鲜。现在先比较再相减。
