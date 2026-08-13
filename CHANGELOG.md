@@ -6,20 +6,54 @@
 
 ### Added
 
-- 缓存命中时评估条件请求：`GET` / `HEAD` 请求的 `If-None-Match` 与 `If-Modified-Since` 与缓存条目的 `ETag` / `Last-Modified` 匹配时返回 `304 Not Modified`，不再发送 Body。`If-None-Match` 优先于 `If-Modified-Since`，比较采用忽略 `W/` 前缀的弱比较，`*` 匹配任何已缓存的表示。多个 `If-None-Match` 字段行会一并评估，含逗号的合法 opaque-tag（如 `"a,b"`）不会被切开。
+- 缓存命中时评估条件请求：`GET` / `HEAD` 请求的 `If-None-Match` 与 `If-Modified-Since` 与缓存条目的 `ETag` / `Last-Modified` 匹配时返回 `304 Not Modified`，不再发送 Body。`If-None-Match` 只要存在就压制 `If-Modified-Since`（即使值为空或不匹配），比较采用忽略 `W/` 前缀的弱比较，`*` 匹配任何已缓存的表示。多个 `If-None-Match` 字段行会一并评估，含逗号的合法 opaque-tag（如 `"a,b"`）不会被切开；重复的 `If-Modified-Since` 属畸形请求，整体忽略。
+- 缓存命中回放时写出 `Age`，表示该响应自源站生成以来的秒数（RFC 9111 §5.1）。只扣减本级 TTL 不足以保护下游——下游的 CDN 或浏览器看到偏小的 `Age` 会把这份响应再多留一段时间。`ResponseCache` 为此新增 `ResponseTime`（收到响应的时刻）与 `InitialAge`（响应到达时已有的年龄）两个字段。本包此前写入的条目没有它们：既无 `ResponseTime` 也无 `Date` 时年龄无从估算，这类条目按未命中处理并由 handler 重新产生响应回填，每个键只需一次回源且被 singleflight 合并。
 
 ### Changed
 
-- **⚠ 破坏性变更**：写入缓存的 TTL 取配置值与响应声明的新鲜期中较小的一个，声明的新鲜期 ≤ 0 时直接拒绝缓存。新鲜期按共享缓存优先级取自 `Cache-Control: s-maxage`、`Cache-Control: max-age`、`Expires` 减 `Date`，并扣除响应已消耗的年龄（`now - Date` 与 `Age` 中较大者），无法解析的 `Expires`（含常见的 `Expires: 0`）按已过期处理。同一新鲜期指令出现多次时取最小值，非法的 delta-seconds（非数字、负数、单边引号）按陈旧处理，超出可表示范围的值钳到最大值。此前 TTL 完全来自中间件配置，handler 声明 `max-age=60` 而中间件配 10 分钟时会回放 10 分钟，`max-age=0`、`s-maxage=0`、已过期的 `Expires` 也照样被缓存回放。`defaultExpire` 与 `Strategy.CacheDuration` 因此是 TTL 上限而不是最终值。
+- **⚠ 破坏性变更**：写入缓存的 TTL 取配置值与响应声明的新鲜期中较小的一个，声明的新鲜期 ≤ 0 时直接拒绝缓存。新鲜期按共享缓存优先级取自 `Cache-Control: s-maxage`、`Cache-Control: max-age`、`Expires` 减 `Date`，并扣除响应已消耗的年龄（`now - Date` 与 `Age` 中较大者），无法解析的 `Expires`（含常见的 `Expires: 0`）按已过期处理。同一新鲜期指令出现多次且取值不同时按陈旧处理（取值相同的重复不算冲突），非法的 delta-seconds 按陈旧处理——`delta-seconds` 的语法是纯数字，`max-age=+600`、`max-age=-1`、单边引号都属非法——超出可表示范围的值钳到最大值。`defaultExpire` 传 0 表示"交由存储决定"，此时中间件不再约束 TTL，只保留"响应已陈旧就不缓存"这道闸门。此前 TTL 完全来自中间件配置，handler 声明 `max-age=60` 而中间件配 10 分钟时会回放 10 分钟，`max-age=0`、`s-maxage=0`、已过期的 `Expires` 也照样被缓存回放。`defaultExpire` 与 `Strategy.CacheDuration` 因此是 TTL 上限而不是最终值。
 - **⚠ 破坏性变更**：内置准入基线新增拒绝 `Vary: *` 的响应。按 RFC 9111 §4.1，`Vary: *` 永远匹配失败，该条目不可能被合法复用。具名 `Vary` 维持放行。
 - `TwoLevelStore.Get` 区分 L1 二次命中与 L2 回源，分别计入 `local_hit` 与 `remote_hit`。此前 singleflight 内第二次本地检查命中时仍无条件计入远端命中，并发回填期间会把 L1 命中算成 L2 命中，`local_hit_rate` 因此失真。
+- **⚠ 破坏性变更**：`TwoLevelStore` 的写路径改为**失效** L1，不再把新值写进 L1。此前两个并发 `Set` 的远端写顺序与 L1 写顺序可以颠倒，导致 Redis 与 L1 的最终值相反而两个调用都返回成功（实测 Redis 为后写入的值、L1 为先写入的值）。现在并发写都只失效 L1，Redis 留下胜者，下次读从 Redis 回填，两级必然一致。影响：`Set` 成功后本实例该 key 的下一次读会穿到 Redis 并回填，写多读少的 key 上 L1 命中率下降。`SetWithContext` 的返回值也随之只表达 Redis 的写入结果，本地失效失败只记录日志——与 `Delete` 的约定一致。
+- **⚠ 破坏性变更**：`persist.WithTwoLevelInvalidationBroadcast` 对 nil 客户端（含 typed-nil）与空 channel 改为构造期 panic，不再静默禁用广播。静默禁用意味着调用方以为开了广播、实际没开，多实例的 L1 会一直陈旧到 `localTTL` 且没有任何信号；typed-nil 此前更会一路走到 `Subscribe` 才 nil 解引用。按条件启用请改用 nil Option（构造函数会跳过它），用法见 README。
+- **⚠ 破坏性变更**：以下构造入口改为在构造期拒绝 nil（含装进接口的 typed-nil），不再把 nil 解引用推迟到第一次读写——`persist.NewRedisStore` 的 `client`、`persist.NewTwoLevelStore` 的 `redisClient`、`persist.WithLocalStore` 的 `local`、`ristrettoadapter.New` 的 `cache`、`ristrettoadapter.WithCost` 的成本函数。被拦下的程序原本必然崩在首次读写，迁移方式是传入非 nil 依赖。其中 `ristrettoadapter.New(nil)` 原本**不会崩**：Ristretto 的方法对 nil receiver 安全，它会静默变成黑洞缓存——每次 `Set` 返回 `nil` 装作写成功，每次 `Get` 返回未命中；这类静默失效现在改为显式报错。
+- **⚠ 破坏性变更**：`persist.WithLocalTTL(0)` 由静默接受改为在 `NewTwoLevelStore` 构造时 panic。`localTTL` 是 L1 的陈旧上限，取 0 会让本地条目永不过期、也永不被后台清理回收：Redis 条目过期后该实例永久返回旧值，L1 同时失去唯一的回收机制、内存只增不减。迁移方式二选一——想用默认的 30 秒就省略 `WithLocalTTL`，需要别的值就传正数。负数入参的语义不变（忽略，保持默认值）。
 
 ### Deprecated
 ### Removed
 ### Fixed
+
+- 修复新鲜期计算在极端日期下的整数回绕：`Time.Sub` 超过约 292 年会饱和到 `MinInt64` / `MaxInt64`，两个饱和值相减恰好绕成 `+1ns`，几百年前就过期的响应会被判成新鲜。现在先比较再相减。
+- 修复回放 `Age` 时入库年龄与驻留时长相加的溢出：超出可表示范围的 `Age` 被钳到最大值后再相加会回绕成负数，最终输出 `Age: 0`，把极老的响应报成刚出炉。现在改用饱和加法。
+- 修复同名不同大小写的 header 被逐个赋值覆盖的问题：它们在 HTTP 语义上是同一个字段，而 Go 的 map 遍历顺序随机，同一份输入会算出不同的新鲜期或不同的条件请求判定结果。现在合并所有大小写变体的值。
+- `current_age` 计入 `response_delay`（handler 全程耗时），且与响应是否带 `Age` 无关——此前只在有 `Age` 时才计入，没有 `Age` 的慢响应会拿到完整新鲜期。`Age` 出现列表形式时按 RFC 9110 §5.5 取第一个成员；出现多个字段行时取最大值，而不是整体忽略。
+- 修复构造出的 `Strategy.CacheKey` 能伪装成另一类 flight 身份的问题：默认存储此前直接用裸键，自定义存储用"地址+分隔符+键"，两个命名空间之间没有分隔，精心构造的键可以撞进另一个存储的 flight 并拿到别的租户的响应。
+- 修复值类型的默认存储完全失去防击穿的问题：靠"取不到地址"判定为自定义存储会给每个请求发独占的 flight 身份，而默认存储自始至终是同一个实例，本该合并。
+- 修复 `Expires` 存在而 `Date` 缺失时驻留时间被重复扣减的问题：回放时用当前时间当基准算出的已经是剩余时间，再与含驻留时长的年龄相比，条目在大约一半寿命处就失效。
+- 修复旧格式条目回放时忽略条目里 `Age` 的问题：一个上游已经放了 120 秒的响应会被报成 `Age: 0`。
+- 接收时刻与初始年龄改为纳秒精度：截成整秒会让初始年龄偏小最多一秒，短新鲜期的条目因此能多活将近一个 `max-age`。
+- 修复用接口比较判断存储身份导致的 panic：以值类型实现接口且含切片字段的存储不可比较，比较会直接打崩中间件。身份改用反射取实例地址，拿不到稳定身份的存储获得本次请求独占的 flight 身份。
+- 修复 `TwoLevelStore` 的 L1 条目会活过对应 Redis 条目的问题：Redis 命中后的回填此前固定使用完整 `localTTL`，一个只剩 1 秒的 Redis 条目能在 L1 里再活 30 秒，事实来源过期之后本实例仍然返回它。现在回填时长取 `min(localTTL, Redis 剩余 TTL)`；取值与剩余时间在同一次 Redis 往返内取回，往返次数不变。Redis 条目在读取过程中消失时不再回填，本次调用仍会拿到已经读到的值；Redis 条目没有过期时间时使用完整 `localTTL`。
+- 修复 L1 条目寿命可能由注入的 `LocalStore` 默认值决定的问题：远端不设过期时间时，本地 TTL 此前被算成 0 并原样传给 `LocalStore`，落到它自己的默认值上。现在 `TwoLevelStore` 始终传出正数 TTL，L1 寿命只由 `localTTL` 与 Redis 剩余 TTL 决定。
+- 修复成功的 `Set` / `Delete` / `InvalidateLocal` 会被在飞的读撤销的问题：变更之前发起的那次读在变更完成之后才回填 L1，把已删除的值复活、或把新值覆盖回旧值，本实例因此继续返回旧数据直到 `localTTL` 到期。现在变更会作废该 key 在飞的读，回填前校验读取期间没有发生变更，且校验与写入不可被同 key 的变更插入。收到其他实例的失效广播时同样作废，因此开启广播的多实例部署一并受益。仅解除 singleflight 关联（`Forget`）不足以做到这一点——它不取消已在执行的读取。
+- 修复 `persist.RedisStore` 在分片型客户端下按模式删除与统计只覆盖单个节点的问题：go-redis 对无 key 命令（如 `SCAN`）只路由到一个节点，因此 `DeletePattern` 会漏掉其余节点的匹配 key、`Stats` 只统计一个节点（实测 Ring 双 shard 下 64 个 key 只扫到 26 个）。现在 `*redis.ClusterClient` 遍历全部 master、`*redis.Ring` 遍历全部 shard。
+- 修复批量删除在 key 跨 hash slot 时失败的问题：一条 `DEL` 带多个 key 时 Redis Cluster 要求所有 key 同属一个 slot，而 go-redis 按首个 key 的 slot 路由且不拆分，跨 slot 会返回 `CROSSSLOT`。现在 `DeleteKeys` 与 `DeletePattern` 都在一次 pipeline 内逐 key 下发，往返次数不变。
+- 修复 `persist.MemoryStore` 的过期删除会吃掉并发写入新值的问题：读取到过期条目与删除它之间允许并发 `Set` 换上新值，无条件删除会把刚写入的新值一起删掉（实测 3000 轮中惰性删除丢 112 次、后台清理丢 127 次）。现在只删除自己读到的那个条目。
+- 修复 `TwoLevelStore` 与中间件的淘汰标记在临界区之外判定的问题：两处此前都是"写入前查一次标记"，定时器可以在查过之后触发，新 leader 随即写入更新的结果，而较旧的那份最后落地把它盖掉。`TwoLevelStore` 在无变更时新旧 leader 的代次相同，两个回填都会通过校验。现在标记的检查与它守护的写入处于同一临界区。
+- 修复中间件在 singleflight 释放超时之后，较旧的响应会覆盖较新缓存的问题：旧 leader 被释放后新 leader 可能先写入较新的响应，而旧 leader 完成时仍无条件写缓存。现在被释放的 leader 不再写缓存；它仍会把响应返回给自己的调用方，也仍会交给此前已加入的等待者。响应自带的年龄机制兜不住这种覆盖——没有 `Cache-Control` 时新鲜期未声明，回放不会被拒。
+- 修复本地变更不作废在飞读取的问题：`Set`、`Delete`、`InvalidateLocal` 之后新发起的读会与变更前开始的那次读合并，从而拿到变更前的值。收到其他实例的失效广播时一直会作废在飞读取，本地变更此前漏了，本地变更的陈旧扩散面因此反而大于远端变更。`DeletePattern` 无法反查在飞读取对应的键，该路径不作废，其窗口受 `localTTL` 约束（见 README 的 L1 陈旧上限）。
+
 ### Security
 
-- **⚠ 破坏性变更**：`DefaultCacheableResponse` 与内置中间件的 `Authorization` 门禁改为大小写无关地读取 header。此前只按规范键查找，`http.Header{"set-cookie": {"x=1"}}` 会被判定为可缓存，请求头里直接写入的小写 `authorization` 也能绕过门禁并让多个请求共享同一份缓存。真实网络流量经 net/http 解析后键必为规范形式，但程序化构造的请求与直接写 map 的 handler 都会踩到。
+- 升级间接依赖 `github.com/quic-go/quic-go` 到 v0.59.1，关闭 GO-2026-5676（HTTP/3 QPACK Trailer 内存耗尽）。本包代码不涉及 HTTP/3，但 `go.mod` 此前把该模块钉在受影响的 v0.59.0，下游依照最小版本选择会一并拿到。
+- L1 失效广播的实例身份改用启动时生成的随机值，不再把实例内存地址写进 Redis Pub/Sub 载荷——凡能订阅该频道的一方此前都能读到这个地址。身份用途不变：接收端据此跳过自己发出的消息。
+- **⚠ 破坏性变更**：回放缓存条目前按 `freshness_lifetime > current_age` 判定新鲜度，其中当前年龄计入条目在缓存中的驻留时间。此前只靠存储 TTL 约束时长，`defaultExpire` 传 0（由存储决定）且存储默认值比声明的新鲜期长时，条目会活过自己的新鲜期还被当成新鲜的回放——实测 `max-age=1` 的条目 1.2 秒后仍然命中。
+- **⚠ 破坏性变更**：singleflight 把 leader 的响应交给并发等待者之前先判定这份响应可否复用；不可复用时等待者各自执行 handler。此前只在写库路径上拦，等待者照拿不误——实测过三种：`no-store` 请求的响应被原样发给普通请求、超过 `WithMaxBodySize` 被丢弃 Body 的响应回放成空 Body、handler 什么都没写时等待者拿到一个编出来的空 `200`。
+- **⚠ 破坏性变更**：singleflight 的合并身份纳入存储身份，且三类身份各带前缀。`Strategy.CacheStore` 允许逐请求选择不同存储（典型用法是按租户分库），此前只按缓存键合并，两个键相同但存储不同的并发请求会共享 leader 的响应——按存储做的隔离被从背后打穿。
+- **⚠ 破坏性变更**：遵守请求的 `Cache-Control: no-store`，该请求的响应不再写入缓存（RFC 9111 §5.2.1.5）。已有条目仍可正常命中——这条指令约束的是存储而不是复用，与本包有意不遵守的请求端 `no-cache` 不是同一层级。
+- **⚠ 破坏性变更**：`Trailer` 头列出的字段、以 `http.TrailerPrefix` 为前缀的运行期 trailer 键，以及 `Proxy-Authentication-Info` 不再进入缓存。此前只删除了 `Trailer` 声明本身，它指向的字段会被当成普通响应头缓存并回放。
+- **⚠ 破坏性变更**：`New` 拒绝装进接口的 typed-nil 存储；`Strategy.CacheStore` 为 typed-nil 时跳过缓存而不是退回默认存储——按存储做租户隔离时，退回默认存储等于把请求写进别人的库。
+- **⚠ 破坏性变更**：`DefaultCacheableResponse` 与内置中间件对请求头的判断全部改为大小写无关，覆盖 `Authorization`、`Range`、`If-None-Match` 与 `If-Modified-Since`。此前只按规范键查找，`http.Header{"set-cookie": {"x=1"}}` 会被判定为可缓存，请求头里直接写入的小写 `authorization` 也能绕过门禁并让多个请求共享同一份缓存，小写 `range` 更会让范围请求命中缓存、把完整响应当成范围响应发出。真实网络流量经 net/http 解析后键必为规范形式，但程序化构造的请求、前置中间件与直接写 map 的 handler 都会踩到。
 
 ## [1.2.0] - 2026-08-10
 

@@ -2,6 +2,7 @@ package ristrettoadapter
 
 import (
 	"context"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,8 +49,14 @@ func WithDefaultExpiration(ttl time.Duration) Option {
 }
 
 // WithCost 设置写入时使用的成本计算函数。
+//
+// fn 为 nil 时在构造期 panic：留着它会在第一次写入时以空函数调用的形式炸出来。
+// 不静默回落到默认成本函数——那是在改写调用方明确传入的值。
 func WithCost(fn CostFunc) Option {
 	return func(s *Store) {
+		if fn == nil {
+			panic("ristrettoadapter: cost function must not be nil")
+		}
 		s.costFn = fn
 	}
 }
@@ -70,7 +77,15 @@ func WithOwnedCache() Option {
 
 // New 把一个现有的 Ristretto 实例包装为 persist.LocalStore。
 // 对外部注入的 cache，tracked key 会在 Stats/DeletePattern 和周期性清理时做惰性收敛。
+//
+// cache 为 nil 时就地 panic。Ristretto 的方法对 nil receiver 是安全的，因此包一个
+// nil 实例不会崩，而是静默变成黑洞缓存——每次 Set 返回 nil 装作写成功，每次 Get
+// 返回未命中。延迟 panic 至少会被发现，静默失效不会。
 func New(cache *ristretto.Cache[string, []byte], opts ...Option) *Store {
+	if cache == nil {
+		panic("ristrettoadapter: cache must not be nil")
+	}
+
 	store := &Store{
 		cache:  cache,
 		costFn: func(_ string, value []byte) int64 { return int64(len(value)) },
@@ -175,7 +190,9 @@ func (s *Store) DeletePattern(_ context.Context, pattern string) (int64, error) 
 		return true
 	})
 
-	s.delCount.Add(uint64(deleted))
+	if deleted > 0 {
+		s.delCount.Add(uint64(deleted))
+	}
 	s.wait()
 	return deleted, nil
 }
@@ -205,11 +222,11 @@ func (s *Store) Stats() map[string]int64 {
 	return map[string]int64{
 		"keys":      keys,
 		"tracked":   keys,
-		"hit":       int64(hit),
-		"miss":      int64(miss),
-		"set":       int64(s.setCount.Load()),
-		"del":       int64(s.delCount.Load()),
-		"reject":    int64(s.rejectCount.Load()),
+		"hit":       countAsInt64(hit),
+		"miss":      countAsInt64(miss),
+		"set":       countAsInt64(s.setCount.Load()),
+		"del":       countAsInt64(s.delCount.Load()),
+		"reject":    countAsInt64(s.rejectCount.Load()),
 		"hit_rate":  int64(hitRate),
 		"max_cost":  s.cache.MaxCost(),
 		"remaining": s.cache.RemainingCost(),
@@ -277,4 +294,15 @@ func (s *Store) wait() {
 	if s.waitOnMutation {
 		s.cache.Wait()
 	}
+}
+
+// countAsInt64 把无符号计数器转成 int64，超出可表示范围时钳到最大值。
+//
+// 统计接口对外是 map[string]int64，而计数器内部是 atomic.Uint64。溢出需要
+// 9.2×10^18 次操作，现实中到不了；钳制是为了让转换本身不带未定义行为。
+func countAsInt64(value uint64) int64 {
+	if value > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(value)
 }

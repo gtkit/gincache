@@ -183,7 +183,12 @@ func TestTwoLevelStoreInvalidationBroadcastClearsOtherLocalCachesOnSet(t *testin
 	}
 }
 
-func TestTwoLevelStoreInvalidationBroadcastPublishesAfterRemoteSetEvenIfLocalSetFails(t *testing.T) {
+// TestTwoLevelStoreInvalidationBroadcastPublishesAfterRemoteSetEvenIfLocalFails 钉住
+// 本地失效失败不阻断广播：Redis 已是新值，其他实例必须照常收到失效消息。
+//
+// 写路径改为失效 L1 之后，这里的本地失败点从 Set 变成 Delete，且 Set 的返回值不再
+// 携带本地失败——返回值表达的是 Redis 的写入结果。
+func TestTwoLevelStoreInvalidationBroadcastPublishesAfterRemoteSetEvenIfLocalFails(t *testing.T) {
 	t.Parallel()
 
 	mini := miniredis.RunT(t)
@@ -197,7 +202,7 @@ func TestTwoLevelStoreInvalidationBroadcastPublishesAfterRemoteSetEvenIfLocalSet
 	storeA := NewTwoLevelStore(clientA,
 		WithLocalTTL(time.Minute),
 		WithRemoteTTL(time.Minute),
-		WithLocalStore(failingSetLocalStore{}),
+		WithLocalStore(failingDeleteLocalStore{}),
 		WithTwoLevelInvalidationBroadcast(clientA, "gincache:test:set-fail-invalidate"),
 	)
 	storeB := NewTwoLevelStore(clientB,
@@ -223,8 +228,9 @@ func TestTwoLevelStoreInvalidationBroadcastPublishesAfterRemoteSetEvenIfLocalSet
 		t.Fatalf("storeB.Get version = %v, want v1", got["version"])
 	}
 
-	if err := storeA.Set("route:/products", map[string]any{"version": "v2"}, time.Minute); !errors.Is(err, errLocalSetFailed) {
-		t.Fatalf("storeA.Set error = %v, want %v", err, errLocalSetFailed)
+	// 本地失效失败只记日志：Redis 写已成功，返回值不该报错。
+	if err := storeA.Set("route:/products", map[string]any{"version": "v2"}, time.Minute); err != nil {
+		t.Fatalf("storeA.Set error = %v, want nil（本地失效失败不混入返回值）", err)
 	}
 
 	eventually(t, time.Second, func() bool {
@@ -537,25 +543,64 @@ func TestTwoLevelStoreDeletePatternAndLocalInvalidationHelpers(t *testing.T) {
 	}
 }
 
-func TestTwoLevelStoreInvalidationBroadcastIgnoresEmptyConfig(t *testing.T) {
+// TestTwoLevelStoreInvalidationBroadcastRejectsEmptyConfig 钉住广播配置的 fail-closed。
+//
+// 这里此前断言的是"配置不全则静默禁用广播"。静默禁用意味着调用方以为开了广播、
+// 实际没开，多实例的 L1 会一直陈旧到 localTTL 且没有任何信号；typed-nil 更是会一路
+// 走到 Subscribe 才 nil 解引用。改为构造期拒绝。
+func TestTwoLevelStoreInvalidationBroadcastRejectsEmptyConfig(t *testing.T) {
 	t.Parallel()
 
-	mini := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
-	t.Cleanup(func() {
-		_ = client.Close()
-	})
+	var typedNilClient *redis.Client
 
-	store := NewTwoLevelStore(client,
-		WithTwoLevelInvalidationBroadcast(nil, "gincache:test:nil-client"),
-		WithTwoLevelInvalidationBroadcast(client, ""),
-	)
-	t.Cleanup(func() {
-		_ = store.Close()
-	})
+	tests := []struct {
+		name    string
+		option  func(redis.UniversalClient) TwoLevelStoreOption
+		wantMsg string
+	}{
+		{
+			name: "nil 客户端",
+			option: func(redis.UniversalClient) TwoLevelStoreOption {
+				return WithTwoLevelInvalidationBroadcast(nil, "gincache:test:c")
+			},
+			wantMsg: "invalidation broadcast client must not be nil",
+		},
+		{
+			name: "typed-nil 客户端",
+			option: func(redis.UniversalClient) TwoLevelStoreOption {
+				return WithTwoLevelInvalidationBroadcast(typedNilClient, "gincache:test:c")
+			},
+			wantMsg: "invalidation broadcast client must not be nil",
+		},
+		{
+			name: "空 channel",
+			option: func(c redis.UniversalClient) TwoLevelStoreOption {
+				return WithTwoLevelInvalidationBroadcast(c, "")
+			},
+			wantMsg: "invalidation broadcast channel must not be empty",
+		},
+	}
 
-	if store.invalidation != nil {
-		t.Fatal("invalidation should stay disabled for empty broadcast config")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			mini := miniredis.RunT(t)
+			client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+			t.Cleanup(func() { _ = client.Close() })
+
+			defer func() {
+				recovered := recover()
+				if recovered == nil {
+					t.Fatal("没有 panic——广播被静默禁用了")
+				}
+				msg, _ := recovered.(string)
+				if !strings.Contains(msg, tc.wantMsg) {
+					t.Fatalf("panic 信息 = %q，want 含 %q", msg, tc.wantMsg)
+				}
+			}()
+			NewTwoLevelStore(client, tc.option(client))
+		})
 	}
 }
 
@@ -658,32 +703,6 @@ func (s *blockingLocalStore) Stats() map[string]int64 {
 }
 
 func (s *blockingLocalStore) ResetStats() {}
-
-var errLocalSetFailed = errors.New("local set failed")
-
-type failingSetLocalStore struct{}
-
-func (failingSetLocalStore) Get(string, any) error {
-	return ErrCacheMiss
-}
-
-func (failingSetLocalStore) Set(string, any, time.Duration) error {
-	return errLocalSetFailed
-}
-
-func (failingSetLocalStore) Delete(string) error {
-	return nil
-}
-
-func (failingSetLocalStore) Close() error {
-	return nil
-}
-
-func (failingSetLocalStore) Stats() map[string]int64 {
-	return map[string]int64{"keys": 0}
-}
-
-func (failingSetLocalStore) ResetStats() {}
 
 var errLocalDeleteFailed = errors.New("local delete failed")
 

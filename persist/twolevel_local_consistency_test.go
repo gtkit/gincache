@@ -12,11 +12,12 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// TestTwoLevelStoreInvalidatesStaleLocalOnSetFailure 钉住 L1 写失败时旧值被失效。
+// TestTwoLevelStoreSetReportsOnlyRemoteResult 钉住本地失效失败不混入 Set 的返回值。
 //
-// 关键动作是失效而不只是报错：Redis 已经是新值，L1 里的旧值若留到 TTL 到期，
-// 本实例这段时间读到的一直是旧的。
-func TestTwoLevelStoreInvalidatesStaleLocalOnSetFailure(t *testing.T) {
+// 返回值表达的是 Redis 的写入结果——Redis 已经是新值，这次写确实成功了。把本地
+// 失败报成错误会让调用方去重试一次已经成功的写入。与 Delete 的约定一致。
+// 本地失效失败时 L1 会残留旧值，最多活到 localTTL。
+func TestTwoLevelStoreSetReportsOnlyRemoteResult(t *testing.T) {
 	t.Parallel()
 
 	mini := miniredis.RunT(t)
@@ -34,18 +35,17 @@ func TestTwoLevelStoreInvalidatesStaleLocalOnSetFailure(t *testing.T) {
 	// L1 里先有一份旧值，模拟这个 key 之前被正常缓存过。
 	local.seed(t, "route:/products", map[string]any{"version": "v1"})
 
-	local.failSet(errLocalSetFailed)
+	// 写路径失效 L1（不再写 L1），因此这里让本地删除失败。
+	local.failDelete(errLocalDeleteFailed)
 	err := store.Set("route:/products", map[string]any{"version": "v2"}, time.Minute)
-	if !errors.Is(err, errLocalSetFailed) {
-		t.Fatalf("Set error = %v, want 包装 %v", err, errLocalSetFailed)
+	if err != nil {
+		t.Fatalf("Set error = %v, want nil——本地失效失败只记日志，Redis 写已成功", err)
 	}
 
-	if local.has("route:/products") {
-		t.Fatal("L1 仍保留旧值：写失败后没有失效")
-	}
+	// 本地失效失败时旧值会残留，最多活到 localTTL；恢复后失效并确认读到新值。
+	local.failDelete(nil)
+	store.InvalidateLocal("route:/products")
 
-	// 读取应当穿到 Redis 拿到新值，而不是本地的 v1。
-	local.failSet(nil)
 	var got map[string]any
 	if err := store.Get("route:/products", &got); err != nil {
 		t.Fatalf("Get error: %v", err)
@@ -55,8 +55,12 @@ func TestTwoLevelStoreInvalidatesStaleLocalOnSetFailure(t *testing.T) {
 	}
 }
 
-// TestTwoLevelStoreKeepsLocalOnSuccessfulSet 钉住写入都成功时不做额外删除。
-func TestTwoLevelStoreKeepsLocalOnSuccessfulSet(t *testing.T) {
+// TestTwoLevelStoreInvalidatesLocalOnSuccessfulSet 钉住写路径失效 L1 而不是写入 L1。
+//
+// 这里此前断言的是"Set 成功后 L1 保留新值、且不调用本地删除"。写 L1 会让两级的
+// 最终值可能相反：远端写在守卫临界区之外，两个并发 Set 的远端写顺序与 L1 写顺序
+// 可以颠倒。改为失效之后，Redis 留下胜者，下次读从 Redis 回填，两级必然一致。
+func TestTwoLevelStoreInvalidatesLocalOnSuccessfulSet(t *testing.T) {
 	t.Parallel()
 
 	mini := miniredis.RunT(t)
@@ -71,15 +75,26 @@ func TestTwoLevelStoreKeepsLocalOnSuccessfulSet(t *testing.T) {
 	)
 	t.Cleanup(func() { _ = store.Close() })
 
+	local.seed(t, "route:/products", map[string]any{"version": "v0"})
+
 	if err := store.Set("route:/products", map[string]any{"version": "v1"}, time.Minute); err != nil {
 		t.Fatalf("Set error: %v", err)
 	}
 
-	if !local.has("route:/products") {
-		t.Fatal("L1 没有保留新写入的值")
+	if local.has("route:/products") {
+		t.Fatal("Set 之后 L1 仍持有值——写路径应当失效 L1")
 	}
-	if n := local.deleteCount(); n != 0 {
-		t.Fatalf("本地删除被调用 %d 次，want 0", n)
+
+	// 下一次读从 Redis 回填，拿到的是刚写入的值。
+	var got map[string]any
+	if err := store.Get("route:/products", &got); err != nil {
+		t.Fatalf("Get error: %v", err)
+	}
+	if got["version"] != "v1" {
+		t.Fatalf("Get version = %v, want v1", got["version"])
+	}
+	if !local.has("route:/products") {
+		t.Fatal("读之后 L1 应已被回填")
 	}
 }
 
@@ -201,13 +216,13 @@ func TestNewTwoLevelStoreValidatesConfiguration(t *testing.T) {
 	})
 }
 
-// staleLocalStore 是一个可控制写入失败、并保留旧值的本地缓存桩。
+// staleLocalStore 是一个可控制写入/删除失败、并保留旧值的本地缓存桩。
 type staleLocalStore struct {
-	mu       sync.Mutex
-	values   map[string][]byte
-	setErr   error
-	deletes  int
-	skipNext bool
+	mu        sync.Mutex
+	values    map[string][]byte
+	deleteErr error
+	deletes   int
+	skipNext  bool
 }
 
 func newStaleLocalStore() *staleLocalStore {
@@ -225,10 +240,10 @@ func (s *staleLocalStore) seed(t *testing.T, key string, value any) {
 	s.values[key] = data
 }
 
-func (s *staleLocalStore) failSet(err error) {
+func (s *staleLocalStore) failDelete(err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.setErr = err
+	s.deleteErr = err
 }
 
 func (s *staleLocalStore) has(key string) bool {
@@ -236,12 +251,6 @@ func (s *staleLocalStore) has(key string) bool {
 	defer s.mu.Unlock()
 	_, ok := s.values[key]
 	return ok
-}
-
-func (s *staleLocalStore) deleteCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.deletes
 }
 
 // failNextGet 让下一次 Get 谎报未命中，用于构造"最外层读不到、singleflight
@@ -270,9 +279,6 @@ func (s *staleLocalStore) Get(key string, value any) error {
 func (s *staleLocalStore) Set(key string, value any, _ time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.setErr != nil {
-		return s.setErr
-	}
 	data, err := json.Marshal(value)
 	if err != nil {
 		return err
@@ -285,6 +291,9 @@ func (s *staleLocalStore) Delete(key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.deletes++
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
 	delete(s.values, key)
 	return nil
 }

@@ -1,6 +1,7 @@
 package gincache
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -362,6 +363,150 @@ func TestSingleFlightForgetTimerBoundToFlight(t *testing.T) {
 	}
 }
 
+// TestSingleFlightIsolatesStores 钉住不同存储不会被同一条 flight 串在一起。
+//
+// Strategy.CacheStore 允许逐请求换存储（典型用法是按租户分库），而 flight 只按
+// CacheKey 合并的话，两个键相同但存储不同的并发请求会共享 leader 的响应——
+// 按存储做的隔离就被从背后打穿了。
+func TestSingleFlightIsolatesStores(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	storeA := persist.NewMemoryStore(time.Minute)
+	storeB := persist.NewMemoryStore(time.Minute)
+	t.Cleanup(func() { _ = storeA.Close(); _ = storeB.Close() })
+
+	var calls atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	engine := gin.New()
+	engine.Use(Cache(storeA, time.Minute,
+		WithCacheStrategyByRequest(func(c *gin.Context) (bool, Strategy) {
+			// 两个租户共用同一个缓存键，只靠存储区分。
+			strategy := Strategy{CacheKey: "shared-key", CacheStore: storeA}
+			if c.GetHeader("X-Tenant") == "B" {
+				strategy.CacheStore = storeB
+			}
+			return true, strategy
+		}),
+	))
+	engine.GET("/x", func(c *gin.Context) {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		c.String(http.StatusOK, "tenant-%s", c.GetHeader("X-Tenant"))
+	})
+
+	serve := func(tenant string) string {
+		request := httptest.NewRequest(http.MethodGet, "/x", nil)
+		request.Header.Set("X-Tenant", tenant)
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, request)
+		return recorder.Body.String()
+	}
+
+	bodies := make([]string, 2)
+	var wg sync.WaitGroup
+	wg.Go(func() { bodies[0] = serve("A") })
+	<-entered
+	wg.Go(func() { bodies[1] = serve("B") })
+
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if bodies[0] == bodies[1] {
+		t.Fatalf("两个租户拿到同一份响应 %q：singleflight 打穿了存储隔离", bodies[0])
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("handler 被调用 %d 次，want 2", got)
+	}
+}
+
+// TestRequestNoStoreSkipsWrite 钉住请求带 Cache-Control: no-store 时不写入缓存。
+//
+// 与请求端的 no-cache 不同层级：no-cache 管"能不能复用"，遵守它会放开缓存击穿；
+// no-store 只管"能不能写"，已有条目照常命中，制造不出别人的 miss（RFC 9111 §5.2.1.5）。
+func TestRequestNoStoreSkipsWrite(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	t.Run("不写入缓存", func(t *testing.T) {
+		var calls atomic.Int32
+		store := persist.NewMemoryStore(time.Minute)
+		t.Cleanup(func() { _ = store.Close() })
+
+		engine := admissionEngine(store)
+		engine.GET("/x", func(c *gin.Context) {
+			calls.Add(1)
+			c.String(http.StatusOK, "ok")
+		})
+
+		for range 2 {
+			request := httptest.NewRequest(http.MethodGet, "/x", nil)
+			request.Header.Set("Cache-Control", "no-store")
+			engine.ServeHTTP(httptest.NewRecorder(), request)
+		}
+
+		if got := calls.Load(); got != 2 {
+			t.Fatalf("handler 被调用 %d 次，want 2：带 no-store 的响应被写入了缓存", got)
+		}
+		var cached ResponseCache
+		if err := store.Get("/x", &cached); err == nil {
+			t.Fatal("带 no-store 的请求把响应写进了 store")
+		}
+	})
+
+	t.Run("已有条目仍可命中", func(t *testing.T) {
+		var calls atomic.Int32
+		store := persist.NewMemoryStore(time.Minute)
+		t.Cleanup(func() { _ = store.Close() })
+
+		engine := admissionEngine(store)
+		engine.GET("/x", func(c *gin.Context) {
+			calls.Add(1)
+			c.String(http.StatusOK, "ok")
+		})
+
+		// 先用普通请求把条目写进去。
+		engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+
+		request := httptest.NewRequest(http.MethodGet, "/x", nil)
+		request.Header.Set("Cache-Control", "no-store")
+		recorder := httptest.NewRecorder()
+		engine.ServeHTTP(recorder, request)
+
+		if got := recorder.Header().Get("X-Cache"); got != "HIT" {
+			t.Fatalf("X-Cache = %q, want HIT：no-store 管的是写，不该连读也挡掉", got)
+		}
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("handler 被调用 %d 次，want 1", got)
+		}
+	})
+
+	t.Run("非规范键的 cache-control 同样生效", func(t *testing.T) {
+		var calls atomic.Int32
+		store := persist.NewMemoryStore(time.Minute)
+		t.Cleanup(func() { _ = store.Close() })
+
+		engine := admissionEngine(store)
+		engine.GET("/x", func(c *gin.Context) {
+			calls.Add(1)
+			c.String(http.StatusOK, "ok")
+		})
+
+		for range 2 {
+			request := httptest.NewRequest(http.MethodGet, "/x", nil)
+			request.Header["cache-control"] = []string{"no-store"}
+			engine.ServeHTTP(httptest.NewRecorder(), request)
+		}
+
+		if got := calls.Load(); got != 2 {
+			t.Fatalf("handler 被调用 %d 次，want 2", got)
+		}
+	})
+}
+
 // TestOptionsDefendAgainstNegativeValues 钉住 Option 对负数入参的防御。
 func TestOptionsDefendAgainstNegativeValues(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -381,8 +526,13 @@ func TestOptionsDefendAgainstNegativeValues(t *testing.T) {
 		t.Fatalf("singleFlightForgetTimeout = %v, want 0（负数应被归零）", m.cfg.singleFlightForgetTimeout)
 	}
 
-	// 归零后不应再创建定时器，stop 是可安全调用的空函数。
-	m.scheduleForget("k")()
+	// 归零后不应再创建定时器，stop 是可安全调用的空函数，且没有定时器会去置位
+	// 淘汰标记。
+	superseded, stop := m.scheduleForget("k")
+	stop()
+	if superseded.Load() {
+		t.Fatal("未安排定时器时不应置位淘汰标记")
+	}
 }
 
 // TestNewValidatesConfiguration 钉住配置错误在构造期而不是请求期暴露。
@@ -427,4 +577,103 @@ func TestNewValidatesConfiguration(t *testing.T) {
 			t.Fatalf("maxBodySize = %d, want 1024（nil Option 应被跳过而非中断）", m.cfg.maxBodySize)
 		}
 	})
+}
+
+// TestUncomparableValueStoreDoesNotPanic 钉住值类型存储不会打崩中间件。
+//
+// 用接口值互相比较来判断"是不是默认存储"，对不可比较的动态类型（带切片字段的
+// 值类型）会直接 panic——为了修跨租户泄漏而引入一个更糟的失败模式。
+func TestUncomparableValueStoreDoesNotPanic(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	inner := persist.NewMemoryStore(time.Minute)
+	t.Cleanup(func() { _ = inner.Close() })
+	store := uncomparableStore{inner: inner, tags: []string{"a"}}
+
+	engine := gin.New()
+	engine.Use(Cache(store, time.Minute,
+		WithCacheStrategyByRequest(func(c *gin.Context) (bool, Strategy) {
+			return true, Strategy{CacheKey: c.Request.URL.Path, CacheStore: store}
+		}),
+	))
+	engine.GET("/x", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
+
+	recorder := httptest.NewRecorder()
+	engine.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/x", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+}
+
+// TestTypedNilStoreRejected 钉住 typed-nil 存储在构造期就被拒。
+//
+// `var store *persist.MemoryStore` 装进接口之后接口本身非 nil，只查 store == nil
+// 会放它过去，错误要拖到第一次读写才以 nil 解引用的形式炸出来。
+func TestTypedNilStoreRejected(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	t.Run("New 构造期 panic", func(t *testing.T) {
+		defer func() {
+			recovered := recover()
+			if recovered == nil {
+				t.Fatal("typed-nil store 没有 panic")
+			}
+			if msg, _ := recovered.(string); msg != "gincache: store must not be nil" {
+				t.Fatalf("panic 信息 = %v", recovered)
+			}
+		}()
+		var store *persist.MemoryStore
+		New(store, time.Minute)
+	})
+
+	t.Run("Strategy 里的 typed-nil 不缓存也不退回默认存储", func(t *testing.T) {
+		var calls atomic.Int32
+		base := persist.NewMemoryStore(time.Minute)
+		t.Cleanup(func() { _ = base.Close() })
+
+		engine := gin.New()
+		engine.Use(Cache(base, time.Minute,
+			WithCacheStrategyByRequest(func(c *gin.Context) (bool, Strategy) {
+				var broken *persist.MemoryStore
+				return true, Strategy{CacheKey: c.Request.URL.Path, CacheStore: broken}
+			}),
+		))
+		engine.GET("/x", func(c *gin.Context) {
+			calls.Add(1)
+			c.String(http.StatusOK, "ok")
+		})
+
+		for range 2 {
+			engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+		}
+
+		if got := calls.Load(); got != 2 {
+			t.Fatalf("handler 被调用 %d 次，want 2", got)
+		}
+		var cached ResponseCache
+		if err := base.Get("/x", &cached); err == nil {
+			t.Fatal("typed-nil 的 Strategy.CacheStore 让响应落进了默认存储")
+		}
+	})
+}
+
+// uncomparableStore 是一个以值类型实现接口、且因含切片字段而不可比较的存储。
+type uncomparableStore struct {
+	inner *persist.MemoryStore
+	tags  []string
+}
+
+func (s uncomparableStore) Get(key string, value any) error { return s.inner.Get(key, value) }
+
+func (s uncomparableStore) Set(key string, value any, expire time.Duration) error {
+	return s.inner.Set(key, value, expire)
+}
+
+func (s uncomparableStore) Delete(key string) error { return s.inner.Delete(key) }
+
+func (s uncomparableStore) SetWithContext(
+	ctx context.Context, key string, value any, expire time.Duration,
+) error {
+	return s.inner.SetWithContext(ctx, key, value, expire)
 }

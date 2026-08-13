@@ -362,6 +362,10 @@ gincache.WithCacheableResponse(func(int, http.Header) bool { return true })
 因此 `defaultExpire` 与 `Strategy.CacheDuration` 是 TTL 上限而不是最终值——handler 声明
 `Cache-Control: max-age=60` 时，即使中间件配了 10 分钟，条目也只缓存 60 秒。
 
+`defaultExpire` 传 **0** 表示"交由存储决定"，此时中间件不再约束 TTL，只保留"响应已经
+陈旧就不缓存"这一道闸门。想让响应声明的新鲜期真正生效，必须给出一个显式的上限——
+否则一个完全合法的 `max-age=31536000` 会把存储的默认 TTL 顶成一年。
+
 新鲜期还会**扣除响应已经消耗掉的部分**（RFC 9111 §4.2.3 的 `current_age`，取 `now - Date`
 与 `Age` 中较大者）。本地 handler 产生的响应没有 `Age`、`Date` 就是当下，这一项为 0；
 只有 handler 在做上游代理并透传这两个头时才起作用——上游的 `max-age=60, Age: 60`
@@ -371,9 +375,31 @@ gincache.WithCacheableResponse(func(int, http.Header) bool { return true })
 以及无法解析的 `Expires`（含常见的 `Expires: 0`，按 RFC 9111 §5.3 视为过去时间）。
 响应未声明新鲜期时，完全沿用配置的 TTL。
 
-指令解析取保守值：同一个新鲜期指令出现多次时取**最小值**（`max-age=600, max-age=0` 与
-`max-age=0, max-age=600` 都判为陈旧）；非法的 delta-seconds（非数字、负数、单边引号）
-按陈旧处理而不是当作没出现；超出可表示范围的值钳到最大值，最终仍与配置 TTL 取小。
+指令解析取保守值：同一个新鲜期指令出现多次且**取值不同**时按陈旧处理（取值相同的重复
+不算冲突）；非法的 delta-seconds 按陈旧处理而不是当作没出现——`delta-seconds` 的语法是
+纯数字，`max-age=+600`、`max-age=-1`、单边引号都属非法；超出可表示范围的值钳到最大值，
+最终仍与配置 TTL 取小。
+
+#### 命中回放会写出 `Age`
+
+回放缓存条目时会写出 `Age`，表示该响应自源站生成以来的秒数。只扣本级 TTL 不够——下游的
+CDN 或浏览器看到偏小的 `Age` 会把这份响应再多留一段时间。
+
+`Age` 取两条估算中较大者：条目 `Date` 到现在的时长；条目记录的"收到响应时刻"到现在的
+驻留时长加上"响应到达时已有的年龄"。两条都无法估算的条目（v1.3.0 之前写入、既无这两个
+字段也无 `Date`）按未命中处理，由 handler 重新产生响应回填——每个键只需一次回源，而且被
+singleflight 合并。
+
+**新鲜度判定也用这个年龄**：回放前按 `freshness_lifetime > current_age` 判定，因此条目一旦
+活过自己声明的新鲜期就不再被回放，哪怕存储的 TTL 还没到。`defaultExpire` 传 0 时尤其重要
+——那时 TTL 由存储决定，可能远长于响应声明的新鲜期。
+
+#### 请求的 `Cache-Control: no-store` 会被遵守
+
+请求带 `no-store` 时，本次响应不写入缓存（RFC 9111 §5.2.1.5）；已有条目仍可正常命中。
+
+这与上面"请求端 `no-cache` 不被遵守"不矛盾：`no-cache` 约束的是**复用**，遵守它等于开放
+一个人人可用的缓存击穿入口；`no-store` 只约束**写入**，带它的请求制造不出别人的未命中。
 
 #### 条件请求返回 304
 
@@ -528,6 +554,57 @@ defer store.Close()
 
 这样可以避免“本地有值但 Redis 写失败”的不一致问题。
 
+### L1 陈旧上限
+
+L1 读到的数据最多陈旧 `localTTL`。这个上限由两条规则维持：
+
+- 写入时 L1 的 TTL 取 `min(localTTL, 远端 TTL)`
+- L2 命中回填时取 `min(localTTL, 远端剩余 TTL)`；远端条目已消失则不回填，远端没有过期时间则用完整 `localTTL`
+
+因此 L1 条目不会活过对应的 L2 条目。需要更小的陈旧窗口就调小 `localTTL`；需要在变更后立刻收敛，用下面的失效广播让其他实例即时清理 L1。
+
+写路径**失效** L1 而不是写入 L1：`Set` 成功后本实例该 key 的下一次读会穿到 Redis 并回填。写入 L1 会让两级的最终值可能相反——远端写在守卫的临界区之外，两个并发 `Set` 的远端写顺序与 L1 写顺序可以颠倒。代价是写多读少的 key 上 L1 命中率下降。
+
+单个 key 的变更（`Set` / `Delete` / `InvalidateLocal`）会让该 key 在飞的读作废：变更之前发起的读不会再把旧值回填进 L1，后续请求重新回源。收到其他实例的失效广播时同样如此，因此开启广播的多实例部署一并受益。
+
+所以"最多陈旧 `localTTL`"主要约束一种情形：**未开启失效广播的多实例部署**。此时本实例无从得知其他实例的变更，只能等 L1 条目自然过期。
+
+`DeletePattern` 与按模式的失效广播无法反查在飞读对应的 key，只能逐分片作废，各分片之间不是原子的，因此按模式变更之后，正在执行的那次读仍可能把变更前的值回填进 L1，存活至多 `localTTL`。
+
+### 构造约束
+
+以下入口在构造期就地拒绝 nil（含装进接口的 typed-nil），而不是把 nil 解引用推迟到第一次读写：
+
+| 入口 | 拒绝的输入 |
+|---|---|
+| `persist.NewRedisStore` | `client` 为 nil |
+| `persist.NewTwoLevelStore` | `redisClient` 为 nil；`localTTL` 为零值 |
+| `persist.WithLocalStore` | `local` 为 nil |
+| `persist.WithTwoLevelInvalidationBroadcast` | `client` 为 nil、`channel` 为空 |
+| `ristrettoadapter.New` / `ristrettoadapter.WithLocalStore` | `cache` 为 nil |
+| `ristrettoadapter.WithCost` | 成本函数为 nil |
+
+`ristrettoadapter.New(nil)` 尤其需要拦：Ristretto 的方法对 nil receiver 是安全的，包一个 nil 实例不会崩，而是静默变成黑洞缓存——每次 `Set` 返回 `nil` 装作写成功，每次 `Get` 返回未命中。
+
+按条件启用广播时用 nil Option，构造函数会跳过它：
+
+```go
+var opt persist.TwoLevelStoreOption
+if broadcastEnabled {
+	opt = persist.WithTwoLevelInvalidationBroadcast(redisClient, "myapp:gincache:l1:invalidate")
+}
+store := persist.NewTwoLevelStore(redisClient, opt)
+```
+
+注入自定义 `LocalStore` 时注意：它的 `Set` 与 `Delete` 会在按 key 分片的临界区内被调用，应尽快返回，不要在其中做网络 I/O 或长时间阻塞。
+
+### 分片型 Redis 客户端
+
+`persist.RedisStore` 支持 `*redis.Client`、`*redis.ClusterClient`、`*redis.Ring`。分片型客户端下：
+
+- `DeletePattern` 与 `Stats` 遍历全部节点扫描（Cluster 遍历全部 master，Ring 遍历全部 shard）。go-redis 对无 key 命令只路由到单个节点，不遍历，因此必须逐节点执行 `SCAN`。
+- 批量删除逐 key 下发（一次 pipeline，往返次数不变），key 跨 hash slot 也能正常删除。一条 `DEL` 带多个跨 slot 的 key 会被 Redis Cluster 拒绝。
+
 ### 默认用法
 
 默认 L1 是 `MemoryStore`。
@@ -540,6 +617,8 @@ store := persist.NewTwoLevelStore(redisClient,
 )
 defer store.Close()
 ```
+
+`WithLocalTTL` 必须传正数。传 0 会在构造时 panic：`localTTL` 就是 L1 的陈旧上限，取 0 会让 L1 条目永不过期也永不被回收，Redis 条目过期后本实例将永久返回旧值。想用默认值（30 秒）就省略这个 Option。负数被忽略，保持默认值。
 
 ### 多实例 L1 失效广播
 

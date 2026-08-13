@@ -80,12 +80,21 @@ func TestWithLocalStoreOptionUsesInjectedCache(t *testing.T) {
 		t.Fatalf("SetWithContext error: %v", err)
 	}
 
+	// 写路径失效 L1 而不写入 L1，因此要先读一次触发回填，再确认注入的 cache 被用上。
 	var got map[string]any
-	if err := local.Get("user:2", &got); err != nil {
-		t.Fatalf("local.Get error: %v", err)
+	if err := store.Get("user:2", &got); err != nil {
+		t.Fatalf("store.Get error: %v", err)
 	}
 	if got["name"] != "bob" {
-		t.Fatalf("local name = %v, want bob", got["name"])
+		t.Fatalf("store name = %v, want bob", got["name"])
+	}
+
+	var cached map[string]any
+	if err := local.Get("user:2", &cached); err != nil {
+		t.Fatalf("local.Get error: %v（回填没有落到注入的 cache 上）", err)
+	}
+	if cached["name"] != "bob" {
+		t.Fatalf("local name = %v, want bob", cached["name"])
 	}
 }
 

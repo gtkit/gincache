@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -474,6 +475,53 @@ func TestNonCanonicalHeaderKeysCannotBypassAdmission(t *testing.T) {
 	})
 }
 
+// TestTrailerFieldsStrippedOnWrite 钉住 Trailer 指向的字段与 TrailerPrefix 不进缓存。
+//
+// 只删 Trailer 声明而留下它列出的字段，等于把 trailer 当成普通响应头缓存并回放；
+// net/http 用 "Trailer:" 前缀承载运行期追加的 trailer，那类键含冒号，既躲过规范键
+// 检查也不在固定清单里。
+func TestTrailerFieldsStrippedOnWrite(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	store := persist.NewMemoryStore(time.Minute)
+	t.Cleanup(func() { _ = store.Close() })
+
+	engine := admissionEngine(store)
+	engine.GET("/x", func(c *gin.Context) {
+		header := c.Writer.Header()
+		header.Set("Trailer", "X-Checksum, X-Signature")
+		header.Set("X-Checksum", "abc123")
+		header.Set("X-Signature", "sig")
+		header.Set(http.TrailerPrefix+"X-Late", "late-value")
+		header.Set("Proxy-Authentication-Info", "nextnonce=xyz")
+		header.Set("Content-Type", "text/plain")
+		c.String(http.StatusOK, "ok")
+	})
+
+	engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+
+	var cached ResponseCache
+	if err := store.Get("/x", &cached); err != nil {
+		t.Fatalf("缓存未写入: %v", err)
+	}
+
+	for _, name := range []string{
+		"Trailer", "X-Checksum", "X-Signature", "Proxy-Authentication-Info",
+	} {
+		if got := cached.Headers.Get(name); got != "" {
+			t.Fatalf("缓存里仍有 %s = %q", name, got)
+		}
+	}
+	for key := range cached.Headers {
+		if strings.HasPrefix(key, http.TrailerPrefix) {
+			t.Fatalf("缓存里仍有 trailer 前缀键 %q", key)
+		}
+	}
+	if got := cached.Headers.Get("Content-Type"); got == "" {
+		t.Fatal("Content-Type 被误删")
+	}
+}
+
 // TestHopByHopHeadersStrippedOnReplay 钉住历史条目回放时也剔除连接级 header。
 //
 // 写入侧过滤只管新数据；已经写进 store 的旧条目只能在回放侧补掉。
@@ -487,7 +535,8 @@ func TestHopByHopHeadersStrippedOnReplay(t *testing.T) {
 			"Content-Type": {"text/plain"},
 			"Connection":   {"keep-alive"},
 		},
-		Body: []byte("cached"),
+		Body:         []byte("cached"),
+		ResponseTime: time.Now().UnixNano(),
 	})
 
 	engine := admissionEngine(store)

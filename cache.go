@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"hash/maphash"
 	"math"
 	"net/http"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -32,8 +34,27 @@ type ResponseCache struct {
 	// Headers 保存完整的 header 集合，缓存命中时优先用它回放响应。
 	Headers http.Header `json:"hv,omitempty"`
 	Body    []byte      `json:"b"`
+	// ResponseTime 是本包收到这份响应的 Unix 纳秒，即 RFC 9111 §4.2.3 的
+	// response_time。回放时用它加上条目里的 Age 得出当前年龄——RFC 9111 §5.1
+	// 要求缓存在复用响应时给出当前年龄，否则下游缓存会低估年龄而超期复用；
+	// 新鲜度判定也要用它，否则存储 TTL 比声明的新鲜期长时条目会活过自己的新鲜期。
+	// 本包此前写入的条目没有这个字段，其零值表示"无法估算"，那类条目不再回放。
+	ResponseTime int64 `json:"t,omitempty"`
+	// InitialAge 是这份响应到达本包时已有的年龄（纳秒），即 RFC 9111 §4.2.3 的
+	// corrected_initial_age。回放时的当前年龄就是它加上驻留时长。
+	//
+	// 两个字段都用纳秒而不是秒：截成整秒会让 InitialAge 偏小最多一秒，
+	// 短新鲜期的条目因此能多活将近一个 max-age。
+	//
+	// 用数值字段而不是把它写回条目的 Age 头：多一个 header 意味着每次命中的
+	// 反序列化都要多分配一个 map 条目、一个切片和一个字符串，实测每次命中多
+	// 6 次分配；数值字段几乎不要钱。
+	InitialAge int64 `json:"a,omitempty"`
 
 	tooLarge bool `json:"-"`
+	// responseDelay 是 handler 的全程耗时，用作 RFC 9111 §4.2.3 的 response_delay。
+	// 只在写入判定时有意义，不随条目持久化。
+	responseDelay time.Duration `json:"-"`
 	// written 记录包装器是否观察到过写入。handler 走 Hijack 接管连接、或根本没
 	// 产生响应时它为 false，此时 Status/Body 都是包装器编出来的默认值。
 	written bool `json:"-"`
@@ -166,78 +187,166 @@ func DefaultCacheableResponse(_ int, header http.Header) bool {
 	return true
 }
 
-// responseFreshness 解析响应自己声明的新鲜期。
+// responseFreshness 返回响应写入缓存那一刻的剩余新鲜期，即声明的新鲜期减去
+// 它到达本包时已有的年龄。回放侧不用它——那时的年龄要算上驻留时间，见 replayable。
+//
+// 第二个返回值表示响应是否声明过新鲜期；未声明时调用方沿用配置的 TTL。
+func responseFreshness(header http.Header, responseDelay time.Duration) (time.Duration, bool) {
+	lifetime, declared := declaredLifetime(header, time.Now())
+	if !declared {
+		return 0, false
+	}
+
+	age := headerAge(header, responseDelay)
+
+	// 先比较再相减。两者都可能是 Time.Sub 的饱和值（超过约 292 年就会顶到
+	// MinInt64 / MaxInt64），直接相减会整数回绕：MinInt64 - MaxInt64 恰好绕成
+	// +1ns，几百年前就过期的响应反而被判成"还新鲜 1 纳秒"。
+	if lifetime <= age {
+		return 0, true
+	}
+
+	return lifetime - age, true
+}
+
+// declaredLifetime 返回响应声明的新鲜期本身，不扣任何年龄。
 //
 // 优先级按 RFC 9111 §4.2.1：s-maxage（只对共享缓存生效）> max-age > Expires - Date。
 // 存在 Expires 但无法解析时按已过期处理——RFC 9111 §5.3 要求把非法日期（尤其是
 // 常见的 "Expires: 0"）当作过去的时间。
 //
 // 第二个返回值表示响应是否声明过新鲜期；未声明时调用方沿用配置的 TTL。
-func responseFreshness(header http.Header) (time.Duration, bool) {
-	var (
-		control                     cacheControlView
-		expiresRaw, dateRaw, ageRaw string
-	)
+func declaredLifetime(header http.Header, receivedAt time.Time) (time.Duration, bool) {
+	controlValues, expiresValues, dateValues, _ := freshnessFields(header)
 
+	control := parseCacheControl(controlValues)
+	switch {
+	case control.hasFreshness:
+		return control.freshness, true
+	// Expires 是 singleton 字段，出现多个值属于畸形，按已过期处理。
+	case len(expiresValues) > 1:
+		return 0, true
+	case len(expiresValues) == 0:
+		return 0, false
+	}
+
+	expiresAt, err := http.ParseTime(expiresValues[0])
+	if err != nil {
+		return 0, true
+	}
+
+	// Date 缺失时以"收到这份响应的时刻"为准（RFC 9111 §4.2.1）。回放侧必须传
+	// 条目自己的 response_time，不能拿当下顶替——那样算出来的已经是剩余时间，
+	// 再和含驻留时长的年龄一比，驻留时间就被扣了两遍，条目在半途就失效。
+	date, ok := headerDate(dateValues)
+	if !ok {
+		date = receivedAt
+	}
+	return expiresAt.Sub(date), true
+}
+
+// headerAge 计算响应到达本包时已有的年龄，即 RFC 9111 §4.2.3 的
+// corrected_initial_age：apparent_age 与 age_value + response_delay 取大者。
+//
+// 本地 handler 产生的响应没有 Age、Date 就是当下，这一项等于 handler 的耗时；
+// handler 在做上游代理时，上游的 "Age: 60" 与这段耗时都会算进来。
+func headerAge(header http.Header, responseDelay time.Duration) time.Duration {
+	_, _, dateValues, ageValues := freshnessFields(header)
+
+	var apparent time.Duration
+	if date, ok := headerDate(dateValues); ok {
+		apparent = max(time.Since(date), 0)
+	}
+
+	// response_delay 与 Age 是否存在无关：没有 Age 时 age_value 视作 0，
+	// 慢响应本身消耗掉的时间照样要算进年龄。
+	corrected := responseDelay
+	if age, ok := maxAgeValue(ageValues); ok {
+		corrected = saturatingAdd(age, responseDelay)
+	}
+
+	return max(apparent, corrected)
+}
+
+// freshnessFields 一趟扫出四个与新鲜度相关的字段。
+//
+// 合并收集而不是逐个赋值：大小写不同的同名键在 HTTP 语义上是同一个字段，
+// 赋值会让后遍历到的那个覆盖前一个，而 Go 的 map 遍历顺序是随机的。
+func freshnessFields(header http.Header) (control, expires, date, age []string) {
 	for key, values := range header {
 		switch {
 		case strings.EqualFold(key, "Cache-Control"):
-			control = parseCacheControl(values)
+			control = mergeValues(control, values)
 		case strings.EqualFold(key, "Expires"):
-			if len(values) > 0 {
-				expiresRaw = values[0]
-			}
+			expires = mergeValues(expires, values)
 		case strings.EqualFold(key, "Date"):
-			if len(values) > 0 {
-				dateRaw = values[0]
-			}
+			date = mergeValues(date, values)
 		case strings.EqualFold(key, "Age"):
-			if len(values) > 0 {
-				ageRaw = values[0]
-			}
+			age = mergeValues(age, values)
 		}
 	}
+	return control, expires, date, age
+}
 
-	// Date 缺失时以"收到响应的时刻"为准，也就是现在（RFC 9111 §4.2.1）。
-	//
-	// 先判空再解析：http.ParseTime 会依次尝试三种格式，每次失败都分配一个
-	// *time.ParseError——本地 handler 的响应通常没有 Date，不该在命中热路径上白付。
-	now := time.Now()
-	date := now
-	if dateRaw != "" {
-		if parsed, err := http.ParseTime(dateRaw); err == nil {
-			date = parsed
+// headerDate 解析 Date。第二个返回值表示是否真的解析到——缺失或畸形时按
+// RFC 9111 §4.2.1 以"收到响应的时刻"为准，而那一刻的 apparent_age 恰好是 0，
+// 由调用方直接取 0，不要再拿两次 time.Now() 相减凑出一个几百纳秒的假年龄。
+//
+// 先判空再解析：http.ParseTime 会依次尝试三种格式，每次失败都分配一个
+// *time.ParseError——本地 handler 的响应通常没有 Date，不该在热路径上白付。
+func headerDate(dateValues []string) (time.Time, bool) {
+	if raw := singletonValue(dateValues); raw != "" {
+		if parsed, err := http.ParseTime(raw); err == nil {
+			return parsed, true
 		}
 	}
+	return time.Time{}, false
+}
 
-	var lifetime time.Duration
-	switch {
-	case control.hasFreshness:
-		lifetime = control.freshness
-	case expiresRaw == "":
-		return 0, false
-	default:
-		expiresAt, err := http.ParseTime(expiresRaw)
-		if err != nil {
-			return -1, true
-		}
-		lifetime = expiresAt.Sub(date)
-	}
+// parseAgeValue 解析单个 Age 值。Age 是 singleton，出现列表形式时按 RFC 9110 §5.5
+// 取第一个成员——整体判为非法会把年龄算小，方向是 fail-open。
+func parseAgeValue(raw string) (time.Duration, bool) {
+	first, _, _ := strings.Cut(raw, ",")
+	return parseDeltaSeconds(first)
+}
 
-	// 扣掉响应已经消耗掉的新鲜期（RFC 9111 §4.2.3 的 current_age）。
-	//
-	// 本地 handler 产生的响应没有 Age、Date 就是当下，这一项为 0，行为不受影响；
-	// 只有 handler 在做上游代理并透传了这两个头时才起作用——那时上游的
-	// "max-age=60, Age: 60" 已经是陈旧响应，不扣就等于又给它续了 60 秒。
-	currentAge := max(now.Sub(date), 0)
-	// 同样先判空：strconv.ParseInt 对空串会分配一个 *strconv.NumError。
-	if ageRaw != "" {
-		if age, ok := parseDeltaSeconds(ageRaw); ok {
-			currentAge = max(currentAge, age)
+// maxAgeValue 返回所有 Age 值中最大的一个。
+//
+// Age 是 singleton 字段，出现多个字段行属于畸形。RFC 9110 §5.5 允许取首个成员，
+// 但合并大小写变体之后"首个"取决于 map 的遍历顺序；取最大值既确定又保守——
+// 年龄算大即新鲜期算短。整个忽略则会把年龄算成 0，方向是 fail-open。
+func maxAgeValue(values []string) (time.Duration, bool) {
+	var (
+		largest time.Duration
+		found   bool
+	)
+	for _, value := range values {
+		if age, ok := parseAgeValue(value); ok {
+			largest, found = max(largest, age), true
 		}
 	}
+	return largest, found
+}
 
-	return lifetime - currentAge, true
+// mergeValues 把同一字段的又一批值并进已有结果。
+//
+// 首批直接复用原切片：绝大多数 header 只有一个键，这样最常见的情形不必付一次
+// 分配。后续批次先 Clip 再 append，保证不写进 header 自己的底层数组。
+// 返回的切片可能与 header 共享底层数组，调用方只读。
+func mergeValues(current, values []string) []string {
+	if current == nil {
+		return values
+	}
+	return append(slices.Clip(current), values...)
+}
+
+// singletonValue 返回 singleton 字段的唯一值；出现零个或多个时返回空串。
+// 多值属于畸形，取其中任何一个都会让结果依赖 map 的遍历顺序。
+func singletonValue(values []string) string {
+	if len(values) != 1 {
+		return ""
+	}
+	return values[0]
 }
 
 // maxDeltaSeconds 是 time.Duration 还能表示的最大秒数。
@@ -253,17 +362,34 @@ const maxDeltaSeconds = int64(math.MaxInt64) / int64(time.Second)
 func parseDeltaSeconds(param string) (time.Duration, bool) {
 	value := unquote(param)
 
+	// delta-seconds 的语法是 1*DIGIT。先自己卡一道纯数字：strconv 会接受 "+600"
+	// 和 "-1"，两者按 RFC 都不合法。卡完之后 ParseInt 只可能因超范围而失败。
+	if !isDigits(value) {
+		return 0, false
+	}
+
 	seconds, err := strconv.ParseInt(value, 10, 64)
 	switch {
-	case errors.Is(err, strconv.ErrRange) && !strings.HasPrefix(value, "-"):
+	case errors.Is(err, strconv.ErrRange), seconds > maxDeltaSeconds:
 		return time.Duration(math.MaxInt64), true
-	case err != nil, seconds < 0:
+	case err != nil:
 		return 0, false
-	case seconds > maxDeltaSeconds:
-		return time.Duration(math.MaxInt64), true
 	}
 
 	return time.Duration(seconds) * time.Second, true
+}
+
+// isDigits 报告 s 是否为非空的纯数字串。
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := range len(s) {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // unquote 去掉成对的双引号。单边引号保持原样，好让它在后续解析中被判为非法，
@@ -295,6 +421,9 @@ func hasVaryStar(values []string) bool {
 type cacheControlView struct {
 	// blocked 表示出现了 no-store / private / no-cache 之一。
 	blocked bool
+	// noStore 单独记录 no-store。响应侧它只是 blocked 的一员，请求侧却有独立
+	// 语义——RFC 9111 §5.2.1.5 要求带它的请求所对应的响应不得被存储。
+	noStore bool
 	// freshness 是声明的新鲜期，hasFreshness 表示是否声明过。
 	freshness    time.Duration
 	hasFreshness bool
@@ -312,7 +441,9 @@ func parseCacheControl(values []string) cacheControlView {
 		for directive := range strings.SplitSeq(value, ",") {
 			name, param, _ := strings.Cut(directive, "=")
 			switch strings.ToLower(strings.TrimSpace(name)) {
-			case "no-store", "private", "no-cache":
+			case "no-store":
+				view.blocked, view.noStore = true, true
+			case "private", "no-cache":
 				view.blocked = true
 			case "s-maxage":
 				sMaxAge, hasSMaxAge = mergeFreshness(sMaxAge, hasSMaxAge, param)
@@ -335,21 +466,27 @@ func parseCacheControl(values []string) cacheControlView {
 
 // mergeFreshness 把同一个新鲜期指令的又一次出现并入已有结果，取更保守的那个。
 //
-// RFC 9111 §4.2.1 对重复指令允许"取首个或按陈旧处理"。这里取最小值：它对两种
-// 出现顺序给出同样保守的结果，而取首个会让 "max-age=600, max-age=0" 仍然缓存
-// 600 秒——同一份响应只因指令先后不同就差出十分钟，不是共享缓存该有的行为。
+// RFC 9111 §4.2.1 对重复指令允许"取首个或按陈旧处理"。取值冲突的重复按陈旧
+// 处理——那是两者中更保守的一个，而取首个会让 "max-age=600, max-age=0" 仍然
+// 缓存 600 秒，同一份响应只因指令先后不同就差出十分钟。
 //
-// 值非法时按陈旧处理（RFC 9111 §1.2.2），而不是把整条指令当作没出现——后者
-// 会退回配置的 TTL，等于让一个写错的 max-age 反而放宽了缓存。
+// 取值相同的重复不算冲突，取该值即可：RFC 针对的是相互矛盾的重复，把
+// "max-age=60, max-age=60" 也判成陈旧过苛。
+//
+// 值非法时同样按陈旧处理（RFC 9111 §1.2.2），而不是把整条指令当作没出现——
+// 后者会退回配置的 TTL，等于让一个写错的 max-age 反而放宽了缓存。
 func mergeFreshness(current time.Duration, has bool, param string) (time.Duration, bool) {
 	parsed, ok := parseDeltaSeconds(param)
-	if !ok {
+	switch {
+	case !ok:
+		return 0, true
+	case !has:
+		return parsed, true
+	case parsed != current:
 		return 0, true
 	}
-	if !has {
-		return parsed, true
-	}
-	return min(current, parsed), true
+
+	return current, true
 }
 
 // WithCacheableResponse 设置响应期缓存判据，**替换**内置基线 DefaultCacheableResponse。
@@ -433,15 +570,40 @@ type Middleware struct {
 	defaultExpire time.Duration
 	cfg           *Config
 	sfGroup       singleflight.Group
+	// flightSeq 给拿不到实例身份的存储发放独占的 flight 编号，见 flightKey。
+	flightSeq atomic.Uint64
+	// writeGuards 按 flight key 分片，序列化同一 flight 的缓存写入，见 cacheResponseFenced。
+	writeGuards [cacheWriteShards]sync.Mutex
+}
+
+// cacheWriteShards 是缓存写入互斥的分片数。定长数组，内存固定，不随 key 数量增长。
+const cacheWriteShards = 256
+
+// cacheWriteShardSeed 只用于算分片下标，与安全无关。
+var cacheWriteShardSeed = maphash.MakeSeed()
+
+// writeGuard 返回 flight 所属分片的写入互斥。
+//
+// 分片键用 flight key 而不是 CacheKey：flight key 已经把存储身份并进去了（见
+// flightKey），按 CacheKey 分片会让不同存储的同名 key 互相争用。
+func (m *Middleware) writeGuard(flight string) *sync.Mutex {
+	return &m.writeGuards[maphash.String(cacheWriteShardSeed, flight)%cacheWriteShards]
 }
 
 // New 创建缓存中间件实例.
+//
+// defaultExpire 是**缓存条目的 TTL 上限**：响应自己声明了更短的新鲜期
+// （Cache-Control 的 s-maxage / max-age，或 Expires）时以声明为准。
+//
+// defaultExpire 传 0 表示"交由存储决定"，此时中间件不再约束 TTL，只保留
+// "响应已经陈旧就不缓存"这一道闸门——想让响应声明的新鲜期真正生效，
+// 必须给出一个显式的上限。
 //
 // 配置错误在这里就地 panic，而不是拖到第一个请求进来时才以 nil 解引用的形式
 // 暴露——那时的报错信息与配置错误毫无关联。会 panic 的情况：store 为 nil，
 // 或 defaultExpire 为负数。opts 中的 nil 元素被跳过。
 func New(store persist.CacheStore, defaultExpire time.Duration, opts ...Option) *Middleware {
-	if store == nil {
+	if isNilStore(store) {
 		panic("gincache: store must not be nil")
 	}
 	if defaultExpire < 0 {
@@ -593,32 +755,61 @@ func (m *Middleware) handle(c *gin.Context) {
 	cacheDuration := m.defaultExpire
 
 	if strategy.CacheStore != nil {
+		// typed-nil 是调用方的 bug。这里不能悄悄退回默认存储——按存储做租户
+		// 隔离时，那等于把这次请求写进别人的库。宁可不缓存。
+		if isNilStore(strategy.CacheStore) {
+			if m.cfg.logger != nil {
+				m.cfg.logger.Errorf("gincache: Strategy.CacheStore is a typed-nil, skip cache")
+			}
+			c.Next()
+			return
+		}
 		cacheStore = strategy.CacheStore
 	}
 	if strategy.CacheDuration > 0 {
 		cacheDuration = strategy.CacheDuration
 	}
 
-	m.handleWithParams(c, cacheKey, cacheStore, cacheDuration)
+	m.handleWithParams(c, cacheRequest{
+		key:      cacheKey,
+		store:    cacheStore,
+		custom:   strategy.CacheStore != nil,
+		duration: cacheDuration,
+	})
+}
+
+// cacheRequest 是一次请求走缓存路径时要带的全部上下文。
+//
+// 这几个值以前是逐个往下传的位置参数，随着规则增加已经到了看不清调用点的程度；
+// 收成一个结构体之后，新增一项不再牵动每个签名。
+type cacheRequest struct {
+	key   string
+	store persist.CacheStore
+	// custom 表示 store 来自 Strategy.CacheStore 而不是默认存储。
+	// 由调用点直接告知，不靠比较存储实例——值类型存储既比较不了也取不到地址。
+	custom   bool
+	duration time.Duration
+	// noStore 表示请求声明了 Cache-Control: no-store。
+	noStore bool
 }
 
 func (m *Middleware) handleWithKey(c *gin.Context, cacheKey string) {
-	m.handleWithParams(c, cacheKey, m.store, m.defaultExpire)
+	m.handleWithParams(c, cacheRequest{key: cacheKey, store: m.store, duration: m.defaultExpire})
 }
 
-func (m *Middleware) handleWithParams(c *gin.Context, cacheKey string, store persist.CacheStore, duration time.Duration) {
+func (m *Middleware) handleWithParams(c *gin.Context, req cacheRequest) {
 	// 0. 范围请求整体绕过缓存。
 	// 缓存键不含 Range / If-Range，两个方向都必然错：读会把完整响应当成范围响应
 	// 发出，写会把某一段字节固化成该 key 的全部内容。把范围条件纳入键也不行——
 	// 键空间会被客户端任意撑爆。
-	if c.Request.Header.Get("Range") != "" {
+	if hasHeaderFold(c.Request.Header, "Range") {
 		c.Next()
 		return
 	}
 
 	// 1. 尝试从缓存读取
 	var cached ResponseCache
-	if err := store.Get(cacheKey, &cached); err == nil {
+	if err := req.store.Get(req.key, &cached); err == nil {
 		// 条目可能是本次准入判据生效之前写进去的，回放前按当前判据复检；
 		// 不通过就当未命中，让 handler 重新产生响应。
 		if header, ok := m.replayable(&cached); ok {
@@ -636,34 +827,111 @@ func (m *Middleware) handleWithParams(c *gin.Context, cacheKey string, store per
 		m.cfg.missCacheCallback(c)
 	}
 
-	// 3. 是否使用 singleflight
+	// 3. 请求带 Cache-Control: no-store 时不得存储本次响应（RFC 9111 §5.2.1.5）。
+	//
+	// 与请求端的 no-cache 不同层级：no-cache 管的是"能不能复用"，遵守它等于放开
+	// 一个人人可用的缓存击穿入口；no-store 只管"能不能写"，已有条目照常命中，
+	// 攻击者拿 no-store 刷也只是让自己的响应不入库，制造不出别人的 miss。
+	req.noStore = requestNoStore(c.Request)
+
+	// 4. 是否使用 singleflight
 	if m.cfg.disableSingleFlight {
-		m.executeAndCache(c, cacheKey, store, duration)
+		m.executeAndCache(c, req)
 		return
 	}
 
-	// 4. 使用 singleflight 防止缓存击穿
-	m.executeWithSingleFlightSafe(c, cacheKey, store, duration)
+	// 5. 使用 singleflight 防止缓存击穿
+	m.executeWithSingleFlightSafe(c, req)
 }
 
-func (m *Middleware) executeAndCache(c *gin.Context, cacheKey string, store persist.CacheStore, duration time.Duration) {
+// requestNoStore 报告请求的 Cache-Control 中是否出现 no-store 指令。
+func requestNoStore(r *http.Request) bool {
+	for key, values := range r.Header {
+		if !strings.EqualFold(key, "Cache-Control") {
+			continue
+		}
+		if parseCacheControl(values).noStore {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Middleware) executeAndCache(c *gin.Context, req cacheRequest) {
 	resp := m.executeHandler(c)
-	m.cacheResponse(cacheKey, resp, store, duration)
+	if !req.noStore {
+		m.cacheResponse(req.key, resp, req.store, req.duration)
+	}
 }
 
-func (m *Middleware) executeWithSingleFlightSafe(c *gin.Context, cacheKey string, store persist.CacheStore, duration time.Duration) {
+// flightKey 把存储身份并进 singleflight 的合并身份。
+//
+// Strategy.CacheStore 允许逐请求换存储（典型用法是按租户分库），而 flight 只按
+// CacheKey 合并的话，两个键相同但存储不同的并发请求会共享 leader 的响应——
+// 按存储做的隔离就被从背后打穿了。
+//
+// 三类身份各带一个前缀，跨类不可能相撞：调用方能自由决定 CacheKey，不加前缀的话
+// 一个精心构造的键就能伪装成另一类的 flight 身份（实测可复现跨存储串用）。
+//
+// "是不是默认存储"由调用点告知而不是比较实例：值类型存储既比较不了（不可比较的
+// 动态类型会 panic）也取不到地址，靠地址判断会让值类型的默认存储彻底失去合并。
+func (m *Middleware) flightKey(req cacheRequest) string {
+	if !req.custom {
+		return "d\x00" + req.key
+	}
+
+	if id := storeIdentity(req.store); id != 0 {
+		return "p" + strconv.FormatUint(uint64(id), 36) + "\x00" + req.key
+	}
+
+	// 以值类型实现接口的自定义存储拿不到稳定的实例身份，无从判断两个请求用的是
+	// 不是同一个。宁可不合并也不能合错：给一个本次请求独占的 flight 身份。
+	return "u" + strconv.FormatUint(m.flightSeq.Add(1), 36) + "\x00" + req.key
+}
+
+// storeIdentity 返回存储实例的稳定身份；指针一类之外的实现拿不到，返回 0。
+func storeIdentity(store persist.CacheStore) uintptr {
+	switch value := reflect.ValueOf(store); value.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Chan, reflect.UnsafePointer:
+		return value.Pointer()
+	default:
+		return 0
+	}
+}
+
+// isNilStore 报告存储是否为 nil，包括装进接口的 typed-nil。
+//
+// `var store *persist.MemoryStore` 装进接口之后接口本身非 nil，只查 store == nil
+// 会放它过去，错误要拖到第一次读写才以 nil 解引用的形式炸出来。
+func isNilStore(store persist.CacheStore) bool {
+	if store == nil {
+		return true
+	}
+
+	switch value := reflect.ValueOf(store); value.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Chan, reflect.Func, reflect.Slice, reflect.UnsafePointer:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func (m *Middleware) executeWithSingleFlightSafe(c *gin.Context, req cacheRequest) {
 	var executedHandler atomic.Bool
 
-	result, err, shared := m.sfGroup.Do(cacheKey, func() (any, error) {
+	// 释放定时器必须用同一个 flight key，否则 Forget 删的是另一条 flight。
+	flight := m.flightKey(req)
+
+	result, err, shared := m.sfGroup.Do(flight, func() (any, error) {
 		// 定时器建在 flight 内并在结束时停止，与 persist/twolevel.go 的写法一致。
 		// 建在 Do 之外的话每个等待者也会建一个、而且没有一个会被停止：早已结束的
 		// 请求，其定时器会在毫不相干的后续 flight 期间 Forget，同一个 key 于是
 		// 出现多个 leader，防击穿失效；高 miss 流量下还会持续积累无效定时器。
-		stopForget := m.scheduleForget(cacheKey)
+		superseded, stopForget := m.scheduleForget(flight)
 		defer stopForget()
 
 		var cached ResponseCache
-		if err := store.Get(cacheKey, &cached); err == nil {
+		if err := req.store.Get(req.key, &cached); err == nil {
 			// 这里也要复检：不合规的历史条目若被放出去，leader 和所有等待者会
 			// 一起 fall through 去执行 handler，singleflight 就被击穿了。
 			if _, ok := m.replayable(&cached); ok {
@@ -673,7 +941,17 @@ func (m *Middleware) executeWithSingleFlightSafe(c *gin.Context, cacheKey string
 
 		executedHandler.Store(true)
 		resp := m.executeHandler(c)
-		m.cacheResponse(cacheKey, resp, store, duration)
+
+		if !req.noStore {
+			m.cacheResponseFenced(flight, superseded, req, resp)
+		}
+
+		if reason, ok := unshareable(req, resp); !ok {
+			if m.cfg.logger != nil {
+				m.cfg.logger.Debugf("gincache: leader response not shareable (%s), waiters fall through", reason)
+			}
+			return nil, nil
+		}
 
 		return resp, nil
 	})
@@ -685,46 +963,78 @@ func (m *Middleware) executeWithSingleFlightSafe(c *gin.Context, cacheKey string
 		return
 	}
 
+	// 先判 leader 再判类型断言。leader 的响应已经通过包装器写出去了，
+	// 若让它落进下面的 c.Next()，整条 handler 链会被二次执行。
+	if executedHandler.Load() {
+		if shared && m.cfg.shareSingleFlightCallback != nil {
+			m.cfg.shareSingleFlightCallback(c)
+		}
+		c.Abort()
+		return
+	}
+
+	// 走到这里说明响应不是本请求产生的：要么来自 store，要么是 leader 刚跑出来的。
+	// leader 判定过不可复用时返回的是空，等待者据此各自回源。
 	resp, ok := result.(*ResponseCache)
 	if !ok {
 		c.Next()
 		return
 	}
 
-	if !executedHandler.Load() {
-		// 走到这里说明响应不是本请求产生的：要么来自 store，要么是 leader 刚跑出来的。
-		// 后一种绕过了 store，此前完全不受判据保护——leader 的 Set-Cookie 会被原样
-		// 发给所有同 key 的并发等待者，和缓存泄漏是同一类会话串号。
-		header, ok := m.replayable(resp)
-		if !ok {
-			c.Next()
-			return
-		}
-
-		if shared && m.cfg.shareSingleFlightCallback != nil {
-			m.cfg.shareSingleFlightCallback(c)
-		}
-		m.writeResponse(c, resp, header)
-		c.Abort()
+	header, ok := m.replayable(resp)
+	if !ok {
+		c.Next()
 		return
 	}
 
 	if shared && m.cfg.shareSingleFlightCallback != nil {
 		m.cfg.shareSingleFlightCallback(c)
 	}
+	m.writeResponse(c, resp, header)
 	c.Abort()
 }
 
-// scheduleForget 为一次 flight 安排释放定时器，返回的函数在 flight 结束时停止它。
-func (m *Middleware) scheduleForget(cacheKey string) func() {
+// unshareable 判定 leader 刚产生的这份响应能不能交给并发等待者，不能时给出原因。
+//
+// "能不能写库"和"能不能共享"是两件事，但都取决于同一组事实。以前只在写库路径
+// 上拦，等待者照拿不误——实测过三种：no-store 请求的响应被原样发给普通请求；
+// 超限被丢弃 Body 的响应回放成空 Body；Hijack 之后包装器什么都没观察到，
+// 等待者却拿到一个编出来的空 200。
+func unshareable(req cacheRequest, resp *ResponseCache) (string, bool) {
+	switch {
+	case req.noStore:
+		return "request declared no-store", false
+	case !resp.written:
+		return "handler wrote nothing through the wrapper", false
+	case resp.tooLarge:
+		return "body exceeded max cache size", false
+	}
+	return "", true
+}
+
+// scheduleForget 为一次 flight 安排释放定时器。入参是 flight key（可能带存储
+// 命名空间前缀），不是原始的 cacheKey。
+//
+// 返回的 superseded 在定时器触发后为真，表示这条 flight 已被释放、可能已有新
+// leader 在跑。stop 在 flight 结束时停止定时器。
+//
+// Forget 只是解除 key 与本 flight 的关联，并不会取消本 flight。被释放之后，新
+// leader 可能先跑完并写入较新的结果，而旧 leader 随后完成时若照样写缓存，就把新
+// 结果覆盖成了旧的——实测请求 C 拿到旧响应且 X-Cache: HIT。响应自带的年龄机制
+// 兜不住：没有 Cache-Control 时新鲜期未声明，回放不会被拒。因此需要这个标记。
+func (m *Middleware) scheduleForget(flight string) (superseded *atomic.Bool, stop func()) {
+	superseded = new(atomic.Bool)
 	if m.cfg.singleFlightForgetTimeout <= 0 {
-		return func() {}
+		return superseded, func() {}
 	}
 
 	timer := time.AfterFunc(m.cfg.singleFlightForgetTimeout, func() {
-		m.sfGroup.Forget(cacheKey)
+		// 先置位再 Forget：反过来的话，会出现"新 leader 已经可以产生、而旧
+		// leader 还没被标记"的瞬间。
+		superseded.Store(true)
+		m.sfGroup.Forget(flight)
 	})
-	return func() { timer.Stop() }
+	return superseded, func() { timer.Stop() }
 }
 
 // =========================================================================
@@ -849,8 +1159,17 @@ func (m *Middleware) executeHandler(c *gin.Context) *ResponseCache {
 		putWriter(cw)
 	}()
 
-	// 执行后续 Handler
+	// 执行后续 Handler。顺带量出耗时：handler 在做上游代理时，这段时间也算进
+	// 响应的年龄（RFC 9111 §4.2.3 的 response_delay）。
+	start := time.Now()
 	c.Next()
+	responseDelay := time.Since(start)
+
+	// response_time 就是此刻。年龄相关的两个字段都在这里落定而不是写入缓存时：
+	// 它们是响应的固有属性，而"有没有被写进缓存"是另一回事——新鲜度不合格的
+	// 响应会在写库路径提前返回，那时再算就永远算不上，等待者据此把陈旧响应
+	// 当成新鲜的收下。
+	responseTime := time.Now()
 
 	headers := cloneCachedHeaders(cw.Header())
 
@@ -859,13 +1178,46 @@ func (m *Middleware) executeHandler(c *gin.Context) *ResponseCache {
 	copy(body, cw.body.Bytes())
 
 	return &ResponseCache{
-		Status:   cw.Status(),
-		Header:   flattenLegacyHeaders(headers),
-		Headers:  headers,
-		Body:     body,
-		tooLarge: cw.overflowed,
-		written:  cw.written,
+		Status:        cw.Status(),
+		Header:        flattenLegacyHeaders(headers),
+		Headers:       headers,
+		Body:          body,
+		ResponseTime:  responseTime.UnixNano(),
+		InitialAge:    int64(max(headerAge(headers, responseDelay), 0)),
+		tooLarge:      cw.overflowed,
+		written:       cw.written,
+		responseDelay: responseDelay,
 	}
+}
+
+// cacheResponseFenced 在分片临界区内确认这条 flight 未被淘汰，然后写缓存。
+//
+// 校验与写入必须在同一临界区。只在写入前查一次不够：定时器可以在查过之后触发，
+// 新 leader 随即产生并写入更新的响应，而这份较旧的结果最后落地就把它盖掉了。
+// 放进同一把锁之后两种交错都以新值收尾——superseded 在 Forget 之前置位，而新 leader
+// 只可能在 Forget 之后产生，因此旧 leader 若在新 leader 写入之后拿到锁，必然看到
+// 标记已置位；在之前拿到，它写的旧值会被随后同样要拿锁的新 leader 覆盖。
+//
+// 锁横跨一次 store 写入（网络往返）。按 flight key 分 256 片，只在同分片写入之间
+// 生效。代价是同分片的另一条 flight 若在写库时被拖慢（Redis 卡顿），这条 flight 的
+// 等待者也会多等一会儿——写缓存发生在 singleflight 的回调内，回调返回才唤醒等待者。
+// 上限是 cacheResponse 自己的写入超时。
+//
+// 只 fence 写缓存这一处：响应仍要返给本请求的调用方，也仍要交给早已加入的等待者
+// （他们一直在等这一份，改判会让他们凭空落空）。
+func (m *Middleware) cacheResponseFenced(flight string, superseded *atomic.Bool, req cacheRequest, resp *ResponseCache) {
+	guard := m.writeGuard(flight)
+	guard.Lock()
+	defer guard.Unlock()
+
+	if superseded.Load() {
+		if m.cfg.logger != nil {
+			m.cfg.logger.Debugf("gincache: flight superseded after forget timeout, skip cache write")
+		}
+		return
+	}
+
+	m.cacheResponse(req.key, resp, req.store, req.duration)
 }
 
 func (m *Middleware) cacheResponse(key string, resp *ResponseCache, store persist.CacheStore, duration time.Duration) {
@@ -901,16 +1253,17 @@ func (m *Middleware) cacheResponse(key string, resp *ResponseCache, store persis
 
 	// 响应自己声明的新鲜期约束回放时长：声明已经过期就不该进缓存，声明比配置短
 	// 就以声明为准。配置 TTL 因此是上限，而不是最终值。
-	if declared, ok := responseFreshness(resp.Headers); ok {
+	if declared, ok := responseFreshness(resp.Headers, resp.responseDelay); ok {
 		if declared <= 0 {
 			if m.cfg.logger != nil {
 				m.cfg.logger.Debugf("gincache: response declares no freshness lifetime, skip cache")
 			}
 			return
 		}
-		// duration 为 0 表示交由存储决定，此时直接用声明值——min(0, 声明) 会退化
-		// 成 0 并被存储当成默认值，反而可能更长。
-		if duration <= 0 || declared < duration {
+		// duration 为 0 表示"交由存储决定"，那是调用方给出的契约，声明的新鲜期
+		// 不该反过来把它顶开：一个完全合法的 max-age=31536000 会把存储的一分钟
+		// 默认变成一年。想要响应驱动的 TTL，就给一个显式的上限。
+		if duration > 0 && declared < duration {
 			duration = declared
 		}
 	}
@@ -954,9 +1307,24 @@ func (m *Middleware) replayable(resp *ResponseCache) (http.Header, bool) {
 		return nil, false
 	}
 
-	// 升级前写入的条目可能声明了一出生就过期的新鲜期，回放前一并挡下。
-	// 这里判定的是条目声明的新鲜期本身，条目是否已经到期由存储的 TTL 负责。
-	if declared, ok := responseFreshness(header); ok && declared <= 0 {
+	// 估算不出年龄的条目不回放。RFC 要求复用存储的响应时给出当前 Age，给不出
+	// 就不该复用。这类条目只可能来自本版本之前的写入：handler 会重新产生响应
+	// 并带上入库时刻回填，因此每个 key 只需一次回源，而且被 singleflight 合并。
+	age, ok := replayAge(header, resp.ResponseTime, resp.InitialAge)
+	if !ok {
+		return nil, false
+	}
+
+	// 新鲜度按 RFC 9111 §4.2 判定：freshness_lifetime > current_age。
+	//
+	// current_age 必须含驻留时间。只靠存储 TTL 兜不住：defaultExpire 传 0 时
+	// TTL 由存储决定，存储默认值比声明的新鲜期长，条目就会活过自己的新鲜期
+	// 还被当成新鲜的回放（实测 max-age=1 的条目 1.2 秒后仍然命中）。
+	receivedAt := time.Now()
+	if resp.ResponseTime > 0 {
+		receivedAt = time.Unix(0, resp.ResponseTime)
+	}
+	if lifetime, declared := declaredLifetime(header, receivedAt); declared && lifetime <= age {
 		return nil, false
 	}
 
@@ -995,6 +1363,13 @@ func (m *Middleware) writeResponse(c *gin.Context, resp *ResponseCache, header h
 	applyCachedHeaders(c.Writer.Header(), header)
 	c.Header("X-Cache", "HIT")
 
+	// 复用缓存条目时必须给出当前年龄（RFC 9111 §5.1）。只扣本级 TTL 不够——
+	// 下游的 CDN 或浏览器看到偏小的 Age 会把这份响应再多留一会儿。
+	// replayable 已经保证年龄可估算，估不出的条目根本走不到回放。
+	if age, ok := replayAge(header, resp.ResponseTime, resp.InitialAge); ok {
+		c.Header("Age", strconv.FormatInt(int64(age/time.Second), 10))
+	}
+
 	if notModified(c.Request, resp.Status, header) {
 		writeNotModified(c)
 		return
@@ -1006,6 +1381,64 @@ func (m *Middleware) writeResponse(c *gin.Context, resp *ResponseCache, header h
 		return
 	}
 	_, _ = c.Writer.Write(resp.Body)
+}
+
+// replayAge 估算回放这个条目时的当前年龄（RFC 9111 §4.2.3 的 current_age）。
+//
+// 新格式条目（有 ResponseTime）用"记下的初始年龄 + 驻留时长"，那个初始年龄已经
+// 折进了上游的 Age 与写入时的 response_delay，因此不再重复读条目里的 Age 头。
+// 旧格式条目只能从响应头估算：Date 给出自源站生成以来的总时长，条目里的 Age
+// 是写入那一刻的年龄（不含驻留时长），两者取大者。
+//
+// 都估算不出来时返回 false——宁可判为不可回放，也不写一个编出来的年龄。
+func replayAge(header http.Header, responseTime, initialAge int64) (time.Duration, bool) {
+	var (
+		age   time.Duration
+		known bool
+	)
+
+	if dateRaw := header.Get("Date"); dateRaw != "" {
+		if date, err := http.ParseTime(dateRaw); err == nil {
+			age, known = max(time.Since(date), 0), true
+		}
+	}
+
+	if responseTime > 0 {
+		resident := max(time.Since(time.Unix(0, responseTime)), 0)
+		return max(age, saturatingAdd(resident, nonNegative(initialAge))), true
+	}
+
+	// 旧格式条目：条目里的 Age 是写入那一刻的年龄，不含驻留时长，只能用来把
+	// 估算往大了抬，不能单独当作"年龄可估"——没有任何时间锚点时驻留时长无从
+	// 得知，宁可判为不可回放。
+	if known {
+		if stored, ok := maxAgeValue(header.Values("Age")); ok {
+			age = max(age, stored)
+		}
+	}
+
+	return age, known
+}
+
+// nonNegative 把持久化的纳秒数转成 Duration，负值当 0——手写或损坏的条目可能带
+// 一个负的初始年龄，直接用会把当前年龄算小。
+func nonNegative(nanos int64) time.Duration {
+	if nanos <= 0 {
+		return 0
+	}
+	return time.Duration(nanos)
+}
+
+// saturatingAdd 相加并在溢出时钳到最大值，入参须为非负。
+//
+// 入库时的 Age 可能是 parseDeltaSeconds 钳出来的 MaxInt64，再加任意驻留时长
+// 就会回绕成负数，被随后的 max 吃掉后输出 Age: 0——把"极老"报成"刚出炉"，
+// 方向正好反了。
+func saturatingAdd(a, b time.Duration) time.Duration {
+	if sum := a + b; sum >= a {
+		return sum
+	}
+	return time.Duration(math.MaxInt64)
 }
 
 // notModified 报告缓存条目对本次条件请求可以答以 304。
@@ -1023,23 +1456,37 @@ func notModified(r *http.Request, status int, header http.Header) bool {
 	// If-None-Match 优先于 If-Modified-Since（RFC 9110 §13.2.2）：前者存在时，
 	// 后者一律不再评估，哪怕前者不匹配。
 	//
-	// 用 Values 而不是 Get：多个字段行等价于逗号连接的一个列表，Get 只会给出
-	// 第一行，后面几行里的 tag 就漏掉了。
-	ifNoneMatch := r.Header.Values("If-None-Match")
-	for _, line := range ifNoneMatch {
-		if strings.TrimSpace(line) != "" {
-			return etagMatches(ifNoneMatch, header.Get("ETag"))
+	// 一趟扫描取两个条件请求头。逐个查找在头不存在时要各扫一遍整张表，而绝大多数
+	// 请求两个都不带；一趟扫描顺带对非规范键天然正确——程序化构造的请求或前置
+	// 中间件可能留下 "if-none-match" 这样的键，只按规范键查会整个漏掉。
+	var (
+		ifNoneMatch, ifModifiedSince []string
+		hasIfNoneMatch               bool
+	)
+	for key, values := range r.Header {
+		switch {
+		case strings.EqualFold(key, "If-None-Match"):
+			ifNoneMatch = mergeValues(ifNoneMatch, values)
+			hasIfNoneMatch = true
+		case strings.EqualFold(key, "If-Modified-Since"):
+			ifModifiedSince = mergeValues(ifModifiedSince, values)
 		}
 	}
 
-	// 先判空再解析：http.ParseTime 会依次尝试三种格式，每次失败都分配一个
-	// *time.ParseError——绝大多数请求不带这个头，不该在命中热路径上白付三次分配。
-	ifModifiedSince := r.Header.Get("If-Modified-Since")
-	if ifModifiedSince == "" {
+	// 只要 If-None-Match **存在**就压制 If-Modified-Since，哪怕它的值为空或不匹配
+	// （RFC 9110 §13.2.2）。多个字段行等价于逗号连接的一个列表，因此整批送去比对。
+	if hasIfNoneMatch {
+		return etagMatches(ifNoneMatch, header.Get("ETag"))
+	}
+
+	// If-Modified-Since 是单个 Date 而不是列表，出现多行属于畸形请求，整体忽略。
+	// 先判空再解析还有一层考虑：http.ParseTime 会依次尝试三种格式，每次失败都
+	// 分配一个 *time.ParseError——绝大多数请求不带这个头，不该在命中热路径上白付。
+	if len(ifModifiedSince) != 1 || ifModifiedSince[0] == "" {
 		return false
 	}
 
-	since, err := http.ParseTime(ifModifiedSince)
+	since, err := http.ParseTime(ifModifiedSince[0])
 	if err != nil {
 		return false
 	}
@@ -1192,6 +1639,7 @@ var hopByHopHeaders = []string{
 	"Transfer-Encoding",
 	"Upgrade",
 	"Proxy-Authenticate",
+	"Proxy-Authentication-Info",
 	"Proxy-Authorization",
 }
 
@@ -1199,7 +1647,7 @@ var hopByHopHeaders = []string{
 // 两项都是无分配的扫描，用来在命中回放的热路径上判断能否跳过整表克隆。
 func needsHeaderCleanup(header http.Header) bool {
 	for key := range header {
-		if http.CanonicalHeaderKey(key) != key {
+		if http.CanonicalHeaderKey(key) != key || strings.HasPrefix(key, http.TrailerPrefix) {
 			return true
 		}
 	}
@@ -1218,17 +1666,31 @@ func needsHeaderCleanup(header http.Header) bool {
 // 清单——RFC 规定 Connection 头里列出的字段名同样是逐跳的，而 Connection 自己
 // 就在待删清单里。
 func deleteHopByHopHeaders(header http.Header) {
-	for _, value := range header["Connection"] {
-		for name := range strings.SplitSeq(value, ",") {
-			if name = strings.TrimSpace(name); name != "" {
-				// 这些名字来自响应方写下的任意字符串，必须走规范化。
-				header.Del(name)
+	// Connection 与 Trailer 都会"指向"另一批字段，被指到的同样不能进缓存：
+	// 删掉 Trailer 声明却留下它列出的字段，等于把 trailer 当成普通响应头缓存。
+	// 必须先读再删——这两个头自己都在待删清单里。
+	for _, list := range [2][]string{header["Connection"], header["Trailer"]} {
+		for _, value := range list {
+			for name := range strings.SplitSeq(value, ",") {
+				if name = strings.TrimSpace(name); name != "" {
+					// 这些名字来自响应方写下的任意字符串，必须走规范化。
+					header.Del(name)
+				}
 			}
 		}
 	}
 
 	for _, name := range hopByHopHeaders {
 		delete(header, name)
+	}
+
+	// net/http 用 "Trailer:" 前缀承载运行期追加的 trailer。这类键含冒号，
+	// 规范化会原样返回，因此既躲过了规范键检查也不在固定清单里——缓存下来
+	// 就会被当成普通响应头回放。
+	for key := range header {
+		if strings.HasPrefix(key, http.TrailerPrefix) {
+			delete(header, key)
+		}
 	}
 }
 
