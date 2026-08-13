@@ -95,11 +95,13 @@ func TestTwoLevelStoreInvalidationBroadcastClearsOtherLocalCachesOnDelete(t *tes
 	storeA := NewTwoLevelStore(clientA,
 		WithLocalTTL(time.Minute),
 		WithRemoteTTL(time.Minute),
+		WithTwoLevelLogger(&captureLogger{}),
 		WithTwoLevelInvalidationBroadcast(clientA, "gincache:test:invalidate"),
 	)
 	storeB := NewTwoLevelStore(clientB,
 		WithLocalTTL(time.Minute),
 		WithRemoteTTL(time.Minute),
+		WithTwoLevelLogger(&captureLogger{}),
 		WithTwoLevelInvalidationBroadcast(clientB, "gincache:test:invalidate"),
 	)
 	t.Cleanup(func() {
@@ -141,11 +143,13 @@ func TestTwoLevelStoreInvalidationBroadcastClearsOtherLocalCachesOnSet(t *testin
 	storeA := NewTwoLevelStore(clientA,
 		WithLocalTTL(time.Minute),
 		WithRemoteTTL(time.Minute),
+		WithTwoLevelLogger(&captureLogger{}),
 		WithTwoLevelInvalidationBroadcast(clientA, "gincache:test:set-invalidate"),
 	)
 	storeB := NewTwoLevelStore(clientB,
 		WithLocalTTL(time.Minute),
 		WithRemoteTTL(time.Minute),
+		WithTwoLevelLogger(&captureLogger{}),
 		WithTwoLevelInvalidationBroadcast(clientB, "gincache:test:set-invalidate"),
 	)
 	t.Cleanup(func() {
@@ -203,11 +207,13 @@ func TestTwoLevelStoreInvalidationBroadcastPublishesAfterRemoteSetEvenIfLocalFai
 		WithLocalTTL(time.Minute),
 		WithRemoteTTL(time.Minute),
 		WithLocalStore(failingDeleteLocalStore{}),
+		WithTwoLevelLogger(&captureLogger{}),
 		WithTwoLevelInvalidationBroadcast(clientA, "gincache:test:set-fail-invalidate"),
 	)
 	storeB := NewTwoLevelStore(clientB,
 		WithLocalTTL(time.Minute),
 		WithRemoteTTL(time.Minute),
+		WithTwoLevelLogger(&captureLogger{}),
 		WithTwoLevelInvalidationBroadcast(clientB, "gincache:test:set-fail-invalidate"),
 	)
 	t.Cleanup(func() {
@@ -297,6 +303,7 @@ func TestTwoLevelStoreWithInvalidationBroadcastClosesImmediately(t *testing.T) {
 	})
 
 	store := NewTwoLevelStore(client,
+		WithTwoLevelLogger(&captureLogger{}),
 		WithTwoLevelInvalidationBroadcast(client, "gincache:test:close"),
 	)
 
@@ -427,6 +434,7 @@ func TestTwoLevelStoreInvalidationBroadcastLogsLocalDeleteFailure(t *testing.T) 
 		WithTwoLevelInvalidationBroadcast(clientA, "gincache:test:delete-fail"),
 	)
 	storeB := NewTwoLevelStore(clientB,
+		WithTwoLevelLogger(&captureLogger{}),
 		WithTwoLevelInvalidationBroadcast(clientB, "gincache:test:delete-fail"),
 	)
 	t.Cleanup(func() {

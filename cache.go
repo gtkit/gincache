@@ -1201,11 +1201,21 @@ func (m *Middleware) executeHandler(c *gin.Context) *ResponseCache {
 // 锁横跨一次 store 写入（网络往返）。按 flight key 分 256 片，只在同分片写入之间
 // 生效。代价是同分片的另一条 flight 若在写库时被拖慢（Redis 卡顿），这条 flight 的
 // 等待者也会多等一会儿——写缓存发生在 singleflight 的回调内，回调返回才唤醒等待者。
-// 上限是 cacheResponse 自己的写入超时。
+// 上限是 writeCacheEntry 里那次写入的超时，前提是存储实现尊重 ctx（见
+// persist.CacheStore 的接口文档）。
 //
 // 只 fence 写缓存这一处：响应仍要返给本请求的调用方，也仍要交给早已加入的等待者
 // （他们一直在等这一份，改判会让他们凭空落空）。
 func (m *Middleware) cacheResponseFenced(flight string, superseded *atomic.Bool, req cacheRequest, resp *ResponseCache) {
+	// 判据先在锁外求值完毕。它包含调用方提供的回调（WithCacheableResponse），
+	// 在临界区内跑调用方代码有两个后果：一次慢回调会堵住整个分片；回调若再触发
+	// 同分片 key 的缓存写入会直接自锁死（sync.Mutex 不可重入）。
+	final, ok := m.cacheDecision(resp, req.duration)
+	if !ok {
+		return
+	}
+
+	// 锁只覆盖"确认未被淘汰 + 写入"这两步。
 	guard := m.writeGuard(flight)
 	guard.Lock()
 	defer guard.Unlock()
@@ -1217,58 +1227,11 @@ func (m *Middleware) cacheResponseFenced(flight string, superseded *atomic.Bool,
 		return
 	}
 
-	m.cacheResponse(req.key, resp, req.store, req.duration)
+	m.writeCacheEntry(req.key, resp, req.store, final)
 }
 
-func (m *Middleware) cacheResponse(key string, resp *ResponseCache, store persist.CacheStore, duration time.Duration) {
-	// 包装器没观察到任何写入：handler 要么 Hijack 接管了连接（WebSocket 升级等），
-	// 要么根本没产生响应。此时 Status 和 Body 都是包装器编出来的默认值，缓存它
-	// 等于用一个空 200 顶掉后续所有请求。
-	if !resp.written {
-		if m.cfg.logger != nil {
-			m.cfg.logger.Debugf("gincache: handler wrote nothing through the wrapper (hijacked?), skip cache")
-		}
-		return
-	}
-
-	// 检查是否应该缓存
-	if !m.shouldCache(resp) {
-		return
-	}
-
-	if resp.tooLarge {
-		if m.cfg.logger != nil {
-			m.cfg.logger.Debugf("gincache: body exceeded max cache size, skip cache")
-		}
-		return
-	}
-
-	// 检查 Body 大小限制
-	if m.cfg.maxBodySize > 0 && int64(len(resp.Body)) > m.cfg.maxBodySize {
-		if m.cfg.logger != nil {
-			m.cfg.logger.Debugf("gincache: body too large, skip cache: %d > %d", len(resp.Body), m.cfg.maxBodySize)
-		}
-		return
-	}
-
-	// 响应自己声明的新鲜期约束回放时长：声明已经过期就不该进缓存，声明比配置短
-	// 就以声明为准。配置 TTL 因此是上限，而不是最终值。
-	if declared, ok := responseFreshness(resp.Headers, resp.responseDelay); ok {
-		if declared <= 0 {
-			if m.cfg.logger != nil {
-				m.cfg.logger.Debugf("gincache: response declares no freshness lifetime, skip cache")
-			}
-			return
-		}
-		// duration 为 0 表示"交由存储决定"，那是调用方给出的契约，声明的新鲜期
-		// 不该反过来把它顶开：一个完全合法的 max-age=31536000 会把存储的一分钟
-		// 默认变成一年。想要响应驱动的 TTL，就给一个显式的上限。
-		if duration > 0 && declared < duration {
-			duration = declared
-		}
-	}
-
-	// 写入缓存
+// writeCacheEntry 把条目写入存储。
+func (m *Middleware) writeCacheEntry(key string, resp *ResponseCache, store persist.CacheStore, duration time.Duration) {
 	// 使用独立于请求的 context，避免客户端取消导致缓存回填中断。
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -1278,6 +1241,67 @@ func (m *Middleware) cacheResponse(key string, resp *ResponseCache, store persis
 			m.cfg.logger.Errorf("gincache: failed to set cache: %v", err)
 		}
 	}
+}
+
+func (m *Middleware) cacheResponse(key string, resp *ResponseCache, store persist.CacheStore, duration time.Duration) {
+	final, ok := m.cacheDecision(resp, duration)
+	if !ok {
+		return
+	}
+	m.writeCacheEntry(key, resp, store, final)
+}
+
+// cacheDecision 判定这份响应能否入库，并给出最终 TTL。
+// 纯判定，不写入、不持锁——判据里有调用方回调，不能在临界区内求值。
+func (m *Middleware) cacheDecision(resp *ResponseCache, duration time.Duration) (time.Duration, bool) {
+	// 包装器没观察到任何写入：handler 要么 Hijack 接管了连接（WebSocket 升级等），
+	// 要么根本没产生响应。此时 Status 和 Body 都是包装器编出来的默认值，缓存它
+	// 等于用一个空 200 顶掉后续所有请求。
+	if !resp.written {
+		if m.cfg.logger != nil {
+			m.cfg.logger.Debugf("gincache: handler wrote nothing through the wrapper (hijacked?), skip cache")
+		}
+		return 0, false
+	}
+
+	// 检查是否应该缓存
+	if !m.shouldCache(resp) {
+		return 0, false
+	}
+
+	if resp.tooLarge {
+		if m.cfg.logger != nil {
+			m.cfg.logger.Debugf("gincache: body exceeded max cache size, skip cache")
+		}
+		return 0, false
+	}
+
+	// 检查 Body 大小限制
+	if m.cfg.maxBodySize > 0 && int64(len(resp.Body)) > m.cfg.maxBodySize {
+		if m.cfg.logger != nil {
+			m.cfg.logger.Debugf("gincache: body too large, skip cache: %d > %d", len(resp.Body), m.cfg.maxBodySize)
+		}
+		return 0, false
+	}
+
+	// 响应自己声明的新鲜期约束回放时长：声明已经过期就不该进缓存，声明比配置短
+	// 就以声明为准。配置 TTL 因此是上限，而不是最终值。
+	if declared, ok := responseFreshness(resp.Headers, resp.responseDelay); ok {
+		if declared <= 0 {
+			if m.cfg.logger != nil {
+				m.cfg.logger.Debugf("gincache: response declares no freshness lifetime, skip cache")
+			}
+			return 0, false
+		}
+		// duration 为 0 表示"交由存储决定"，那是调用方给出的契约，声明的新鲜期
+		// 不该反过来把它顶开：一个完全合法的 max-age=31536000 会把存储的一分钟
+		// 默认变成一年。想要响应驱动的 TTL，就给一个显式的上限。
+		if duration > 0 && declared < duration {
+			duration = declared
+		}
+	}
+
+	return duration, true
 }
 
 func (m *Middleware) shouldCache(resp *ResponseCache) bool {

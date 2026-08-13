@@ -3,6 +3,7 @@ package persist
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -69,6 +70,38 @@ func NewRedisStore(client redis.Cmdable, opts ...RedisStoreOption) *RedisStore {
 
 func (s *RedisStore) key(k string) string {
 	return s.keyPrefix + k
+}
+
+// scanPattern 把调用方的 pattern 拼成 SCAN 用的 glob。
+//
+// 固定前缀必须先转义：WithKeyPrefix 接受任意字符串，前缀里的 * ? [ ] \ 会改变模式
+// 含义——`app*:` 这样的前缀能让 DeletePattern 匹配到别的命名空间并把它删掉。调用方
+// 传入的 pattern 保持原样，它的通配语义正是调用方要的。
+//
+// 单 key 路径（key 方法）不转义：那里的结果是字面 key，不经过 glob 匹配，转义反而
+// 会寻址到错误的 key。
+func (s *RedisStore) scanPattern(pattern string) string {
+	return escapeGlobMeta(s.keyPrefix) + pattern
+}
+
+// escapeGlobMeta 转义 Redis glob 的元字符，使字符串只匹配自身。
+func escapeGlobMeta(s string) string {
+	if !strings.ContainsAny(s, `*?[]\`) {
+		return s
+	}
+
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	for i := range len(s) {
+		switch c := s[i]; c {
+		case '*', '?', '[', ']', '\\':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // Get 从 Redis 获取缓存
@@ -189,11 +222,21 @@ func (s *RedisStore) eachNode(ctx context.Context, fn func(ctx context.Context, 
 	}
 }
 
+// 两条扫描路径的批量大小。删除要拿着 key 做后续操作，批小些让每轮工作量可控；
+// 统计只累加数量，批大些以减少往返。
+const (
+	deleteScanCount = 100
+	statsScanCount  = 1000
+)
+
 // scanNode 在单个节点上按模式扫描，对每批扫到的 key 调用 fn。
-func scanNode(ctx context.Context, node redis.Cmdable, pattern string, fn func(keys []string) error) error {
+//
+// count 是 SCAN 的批量大小，由调用点决定——两条路径的取值不同，统一成一个值会让
+// 其中一方要么多付往返、要么每轮工作量过大。
+func scanNode(ctx context.Context, node redis.Cmdable, pattern string, count int64, fn func(keys []string) error) error {
 	var cursor uint64
 	for {
-		keys, nextCursor, err := node.Scan(ctx, cursor, pattern, 100).Result()
+		keys, nextCursor, err := node.Scan(ctx, cursor, pattern, count).Result()
 		if err != nil {
 			return err
 		}
@@ -234,29 +277,38 @@ func deleteEachKey(ctx context.Context, node redis.Cmdable, keys []string) (int6
 	for i, key := range keys {
 		cmds[i] = pipe.Del(ctx, key)
 	}
-	if _, err := pipe.Exec(ctx); err != nil {
-		return 0, err
-	}
+	_, execErr := pipe.Exec(ctx)
 
+	// Exec 返回错误不代表所有命令都没执行——它给的是首个命令错误。因此无论 Exec
+	// 结果如何都要把每条命令的结果取出来：已经删掉的必须计入，否则调用方拿到的
+	// 删除数不真实，上层也分不清"部分成功"和"完全失败"（后者才不需要广播失效）。
 	var deleted int64
+	var firstCmdErr error
 	for _, cmd := range cmds {
 		n, err := cmd.Result()
 		if err != nil {
-			return deleted, err
+			if firstCmdErr == nil {
+				firstCmdErr = err
+			}
+			continue
 		}
 		deleted += n
 	}
-	return deleted, nil
+
+	if firstCmdErr != nil {
+		return deleted, firstCmdErr
+	}
+	return deleted, execErr
 }
 
 // DeletePattern 按模式删除缓存（使用 SCAN，生产安全）。
 // 分片型客户端（*redis.ClusterClient、*redis.Ring）会遍历全部节点。
 func (s *RedisStore) DeletePattern(ctx context.Context, pattern string) (int64, error) {
-	fullPattern := s.key(pattern)
+	fullPattern := s.scanPattern(pattern)
 
 	var deleted atomic.Int64
 	err := s.eachNode(ctx, func(ctx context.Context, node redis.Cmdable) error {
-		return scanNode(ctx, node, fullPattern, func(keys []string) error {
+		return scanNode(ctx, node, fullPattern, deleteScanCount, func(keys []string) error {
 			n, err := deleteEachKey(ctx, node, keys)
 			deleted.Add(n)
 			return err
@@ -304,6 +356,14 @@ func (s *RedisStore) Ping(ctx context.Context) error {
 
 // Stats 获取统计信息。
 // 分片型客户端（*redis.ClusterClient、*redis.Ring）会统计全部节点。
+//
+// 代价与本前缀下的 key 总量成正比：它用 SCAN 遍历整个前缀，分片客户端下还要遍历每个
+// 节点。**不适合高频轮询**，把它接到每秒抓取的监控端点上会持续给 Redis 加压。需要
+// 常态化的命中率指标时，用 TwoLevelStore.Stats 的计数器字段（hit/miss 是内存计数，
+// 与 key 总量无关），或自行降低采集频率。
+//
+// 扫描未能在读取超时内走完时，返回已统计到的部分数量而不报错——Stats 是可观测接口，
+// 不因此整体失败，但这意味着大 keyspace 上的 keys 值可能偏小。
 func (s *RedisStore) Stats() map[string]int64 {
 	ctx, cancel := context.WithTimeout(context.Background(), s.readTimeout)
 	defer cancel()
@@ -312,7 +372,7 @@ func (s *RedisStore) Stats() map[string]int64 {
 	// 接口，不因单个节点不可用而整体失败。
 	var count atomic.Int64
 	_ = s.eachNode(ctx, func(ctx context.Context, node redis.Cmdable) error {
-		return scanNode(ctx, node, s.key("*"), func(keys []string) error {
+		return scanNode(ctx, node, s.scanPattern("*"), statsScanCount, func(keys []string) error {
 			count.Add(int64(len(keys)))
 			return nil
 		})

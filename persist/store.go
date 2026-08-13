@@ -12,7 +12,12 @@ import (
 // ErrCacheMiss 缓存未命中错误
 var ErrCacheMiss = errors.New("cache: key not found")
 
-// CacheStore 缓存存储接口
+// CacheStore 缓存存储接口。
+//
+// 实现方约束：SetWithContext 必须尊重 ctx 的取消与超时。中间件写缓存时会持有一把按
+// 缓存键分片的互斥（用于保证被超时淘汰的请求不会覆盖更新的响应），这次写入就发生在
+// 临界区内。一个无视 ctx、迟迟不返回的实现会一直占住该分片，同分片的其他缓存写入
+// 及其等待者都会被拖住。
 type CacheStore interface {
 	// Get 获取缓存，如果不存在返回 ErrCacheMiss
 	Get(key string, value any) error
@@ -23,7 +28,8 @@ type CacheStore interface {
 	// Delete 删除缓存
 	Delete(key string) error
 
-	// SetWithContext 带 Context 的设置缓存（支持超时控制）
+	// SetWithContext 带 Context 的设置缓存（支持超时控制）。
+	// 必须尊重 ctx——调用方会在持有分片互斥的状态下调用它，见 CacheStore 的接口文档。
 	SetWithContext(ctx context.Context, key string, value any, expire time.Duration) error
 }
 

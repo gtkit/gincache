@@ -42,6 +42,12 @@ import (
 // DeletePattern 与按模式的失效广播无法反查在飞读对应的 key，只能逐分片作废，
 // 各分片之间不是原子的，因此按模式变更之后，正在执行的那次读仍可能把变更前的值
 // 回填进 L1，存活至多 localTTL。
+//
+// L1 的容量由调用方负责：默认的 MemoryStore 只依赖 TTL 回收，没有条目数上限。
+// 缓存键含高基数成分时改用 WithLocalStore 注入带容量上限的实现，详见 MemoryStore
+// 的类型文档。
+//
+// 必须调用 Close，否则默认 MemoryStore 的清理协程与广播订阅协程会一直存活。
 type TwoLevelStore struct {
 	local     LocalStore
 	remote    *RedisStore
@@ -61,6 +67,9 @@ type TwoLevelStore struct {
 	miss      atomic.Uint64
 
 	guards [twoLevelGuardShards]twoLevelKeyGuard
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // guard 返回 key 所属分片的代次守卫。
@@ -287,6 +296,13 @@ func NewTwoLevelStore(redisClient redis.Cmdable, opts ...TwoLevelStoreOption) *T
 		panic("gincache: localTTL must not be zero: omit WithLocalTTL to keep the default, or pass a positive duration")
 	}
 
+	// 开了广播就必须有 logger。订阅启动失败（随机源不可用、Redis 暂时连不上）会让
+	// 广播在本实例的生命周期内保持关闭，而调用方开广播正是在依赖跨实例的 L1 收敛：
+	// 没有 logger 时这个降级毫无信号，故障表现是"多实例偶发读到旧数据"，极难归因。
+	if s.invalidation != nil && s.logger == nil {
+		panic("gincache: WithTwoLevelInvalidationBroadcast requires WithTwoLevelLogger: subscriber startup failures must be observable")
+	}
+
 	if s.local == nil {
 		cleanupInterval := max(s.localTTL/2, 10*time.Second)
 		s.local = NewMemoryStore(s.localTTL, WithCleanupInterval(cleanupInterval))
@@ -383,8 +399,17 @@ func localBackfillTTL(localTTL, remaining time.Duration) (time.Duration, bool) {
 }
 
 // Set 写 Redis，成功后失效本地缓存。
+//
+// 自带上界：整个操作（远端写入与失效广播）受 RedisStore 的写超时约束
+// （见 WithWriteTimeout，默认 3 秒）。需要自己控制期限时用 SetWithContext。
 func (s *TwoLevelStore) Set(key string, value any, expire time.Duration) error {
-	return s.SetWithContext(context.Background(), key, value, expire)
+	// 不能直接用 context.Background()：RedisStore 的写超时只在它自己的 Set 里生效，
+	// 它的 SetWithContext 直接用传入的 ctx。传 Background 等于这条路径完全没有上界，
+	// 启用广播时那个无限 ctx 还会一路传给 Publish。
+	ctx, cancel := context.WithTimeout(context.Background(), s.remote.writeTimeout)
+	defer cancel()
+
+	return s.SetWithContext(ctx, key, value, expire)
 }
 
 // SetWithContext 写 Redis，成功后失效本地缓存，而不是把新值写进 L1。
@@ -444,7 +469,11 @@ func (s *TwoLevelStore) Delete(key string) error {
 	s.sf.Forget(key)
 
 	if err == nil {
-		s.publishInvalidation(context.Background(), twoLevelInvalidationKey, key)
+		// 与 Set 同理：Publish 不能拿无上界的 Background，否则 Redis 卡住时 Delete
+		// 也没有期限。
+		pubCtx, cancel := context.WithTimeout(context.Background(), s.remote.writeTimeout)
+		defer cancel()
+		s.publishInvalidation(pubCtx, twoLevelInvalidationKey, key)
 	}
 	return err
 }
@@ -456,7 +485,11 @@ func (s *TwoLevelStore) DeletePattern(ctx context.Context, pattern string) (int6
 
 	s.invalidateLocalPattern(ctx, pattern)
 
-	if err == nil {
+	// 只要远端确实删掉了东西就广播，即使同时报了错。扇出到多个节点后"部分分片成功、
+	// 另一些失败"是可达的组合：已删掉的 key 若不广播，其他实例的 L1 会继续供旧数据
+	// 直到 localTTL 到期。多失效一次只让对方多读一次 Redis，是安全方向。
+	// 完全失败（一个都没删掉）不广播——没有任何东西需要失效。
+	if err == nil || n > 0 {
 		s.publishInvalidation(ctx, twoLevelInvalidationPattern, pattern)
 	}
 	return n, err
@@ -494,6 +527,10 @@ func (s *TwoLevelStore) InvalidateLocalPattern(pattern string) {
 }
 
 // Stats 返回两级缓存的聚合统计信息。
+//
+// local_hit / remote_hit / miss 与两个命中率都来自内存计数器，取用代价与缓存规模无关。
+// local_keys 来自 L1 的 Stats，需要遍历全部本地条目，代价与条目数成正比——高频轮询
+// 请只用计数器字段。
 func (s *TwoLevelStore) Stats() map[string]int64 {
 	localStats := s.local.Stats()
 
@@ -530,10 +567,18 @@ func (s *TwoLevelStore) ResetStats() {
 	s.local.ResetStats()
 }
 
-// Close 关闭本地缓存。
+// Close 停止失效广播订阅并关闭本地缓存。
+// 必须调用；重复调用是安全的。不调用会让默认 MemoryStore 的清理协程以及广播订阅
+// 协程一直存活。
 func (s *TwoLevelStore) Close() error {
-	s.closeInvalidation()
-	return s.local.Close()
+	// 注入的 LocalStore 只关一次并缓存结果：LocalStore 契约没有要求 Close 幂等，
+	// 而 WithLocalStore 接受任意实现。少了这层，"重复调用是安全的"只对默认
+	// MemoryStore 成立。
+	s.closeOnce.Do(func() {
+		s.closeInvalidation()
+		s.closeErr = s.local.Close()
+	})
+	return s.closeErr
 }
 
 // LocalStore 返回当前配置的本地缓存实现。

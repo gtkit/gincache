@@ -15,6 +15,18 @@ import (
 // - 使用 sync.Map 实现，读多写少场景性能好
 // - 后台协程定期清理过期数据
 // - 支持统计信息
+//
+// 使用约束：
+//
+// 容量由调用方负责。条目的回收只依赖 TTL，没有条目数上限也没有淘汰策略，因此峰值
+// 内存约等于「一个 TTL 窗口内出现过的不同 key 数 × 单条目大小」。缓存键含高基数
+// 成分（查询参数、用户 ID、分页游标等）时，请改用带容量上限的本地缓存——本仓库的
+// persist/ristrettoadapter 子模块把 Ristretto（有 MaxCost）包装成 LocalStore，可直接
+// 通过 WithLocalStore 注入 TwoLevelStore。中间件的 WithMaxBodySize 只约束单条响应体
+// 大小，不约束条目数量。
+//
+// 必须调用 Close：NewMemoryStore 会启动一个后台清理协程，不调用 Close 会让它一直
+// 存活。按租户、按配置动态创建 store 的用法尤其要注意。
 type MemoryStore struct {
 	data              sync.Map
 	defaultExpiration time.Duration
@@ -44,7 +56,10 @@ func WithCleanupInterval(interval time.Duration) MemoryStoreOption {
 	}
 }
 
-// NewMemoryStore 创建内存存储
+// NewMemoryStore 创建内存存储。
+//
+// 会启动一个后台清理协程，调用方必须在不再使用时调用 Close，否则该协程一直存活。
+// 容量责任与高基数场景的替代实现见 MemoryStore 的类型文档。
 func NewMemoryStore(defaultExpiration time.Duration, opts ...MemoryStoreOption) *MemoryStore {
 	s := &MemoryStore{
 		defaultExpiration: defaultExpiration,
@@ -157,7 +172,8 @@ func (s *MemoryStore) Flush() {
 	})
 }
 
-// Close 关闭存储，停止清理协程
+// Close 关闭存储，停止清理协程。
+// 必须调用；重复调用是安全的。不调用会让构造时启动的清理协程一直存活。
 func (s *MemoryStore) Close() error {
 	if s.stopped.CompareAndSwap(false, true) {
 		close(s.stopCleanup)
@@ -165,7 +181,10 @@ func (s *MemoryStore) Close() error {
 	return nil
 }
 
-// Stats 获取统计信息
+// Stats 获取统计信息。
+//
+// keys 与 expired 需要遍历全部条目，代价与条目数成正比，不适合高频轮询。
+// hit / miss / set / del 是内存计数器，取用它们不受条目数影响。
 func (s *MemoryStore) Stats() map[string]int64 {
 	var count, expired int64
 	now := time.Now().UnixNano()

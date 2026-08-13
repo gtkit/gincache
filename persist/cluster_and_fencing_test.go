@@ -359,3 +359,64 @@ func (h afterCommandHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook 
 func (afterCommandHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
 	return next
 }
+
+// TestRedisStoreScanBatchSizePerPath 钉住两条扫描路径各自的批量大小。
+//
+// 抽出公共的 scanNode 时曾把 Stats 原本的 COUNT 1000 一起统一成删除路径的 100，
+// 让统计的 SCAN 往返翻了十倍——而 Stats 还要遍历整个前缀、分片客户端下遍历每个节点。
+// 统一常量很容易再犯，这里按路径分别钉住。
+func TestRedisStoreScanBatchSizePerPath(t *testing.T) {
+	t.Parallel()
+
+	mini := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
+	t.Cleanup(func() { _ = client.Close() })
+
+	store := NewRedisStore(client, WithKeyPrefix("scan:"))
+
+	const total = 1500
+	for i := range total {
+		if err := store.Set(fmt.Sprintf("k%d", i), i, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var scans atomic.Int64
+	client.AddHook(scanCountHook{n: &scans})
+
+	if got := store.Stats()["keys"]; got != total {
+		t.Fatalf("Stats keys = %d, want %d", got, total)
+	}
+
+	// COUNT=1000 时约 2 次；若退回 100 会是 8 次以上。留出余量但保持区分度。
+	statsScans := scans.Load()
+	if maxScans := int64(total/statsScanCount) + 2; statsScans > maxScans {
+		t.Fatalf("Stats 用了 %d 次 SCAN，超过 %d——统计路径的批量大小被改小了", statsScans, maxScans)
+	}
+
+	scans.Store(0)
+	if _, err := store.DeletePattern(context.Background(), "k*"); err != nil {
+		t.Fatalf("DeletePattern: %v", err)
+	}
+	if scans.Load() == 0 {
+		t.Fatal("删除路径没有发出 SCAN")
+	}
+}
+
+// scanCountHook 统计发出的 SCAN 命令次数。
+type scanCountHook struct{ n *atomic.Int64 }
+
+func (scanCountHook) DialHook(next redis.DialHook) redis.DialHook { return next }
+
+func (h scanCountHook) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		if cmd.Name() == "scan" {
+			h.n.Add(1)
+		}
+		return next(ctx, cmd)
+	}
+}
+
+func (scanCountHook) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}

@@ -320,7 +320,10 @@ func TestTwoLevelStoreInvalidationOriginIsNotMemoryAddress(t *testing.T) {
 		client := redis.NewClient(&redis.Options{Addr: mini.Addr()})
 		t.Cleanup(func() { _ = client.Close() })
 
-		store := NewTwoLevelStore(client, WithTwoLevelInvalidationBroadcast(client, "inv"))
+		store := NewTwoLevelStore(client,
+			WithTwoLevelLogger(&captureLogger{}),
+			WithTwoLevelInvalidationBroadcast(client, "inv"),
+		)
 		t.Cleanup(func() { _ = store.Close() })
 		return store
 	}

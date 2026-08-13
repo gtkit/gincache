@@ -571,6 +571,38 @@ L1 读到的数据最多陈旧 `localTTL`。这个上限由两条规则维持：
 
 `DeletePattern` 与按模式的失效广播无法反查在飞读对应的 key，只能逐分片作废，各分片之间不是原子的，因此按模式变更之后，正在执行的那次读仍可能把变更前的值回填进 L1，存活至多 `localTTL`。
 
+### L1 容量责任与生命周期
+
+两条运维约束，上线前请确认：
+
+**容量由调用方负责。** 默认的 `persist.MemoryStore` 只依赖 TTL 回收条目，**没有条目数上限、没有淘汰策略**。峰值内存约等于：
+
+```
+一个 localTTL 窗口内出现过的不同 key 数 × 单条目大小
+```
+
+中间件的 `WithMaxBodySize` 只约束单条响应体大小，不约束条目数量。因此缓存键含高基数成分（查询参数、用户 ID、分页游标等）时，必须换成带容量上限的 L1：
+
+```go
+// 用 Ristretto（有 MaxCost）作为 L1
+cache, err := ristretto.NewCache(&ristretto.Config[string, []byte]{
+	NumCounters: 1e7,
+	MaxCost:     256 << 20, // 256MB 上限
+	BufferItems: 64,
+})
+if err != nil {
+	return err
+}
+
+store := persist.NewTwoLevelStore(redisClient,
+	persist.WithLocalTTL(30*time.Second),
+	ristrettoadapter.WithLocalStore(cache, ristrettoadapter.WithOwnedCache()),
+)
+defer store.Close()
+```
+
+**必须调用 `Close`。** `persist.NewMemoryStore` 会启动后台清理协程，开启失效广播时还会有订阅协程。不调用 `Close` 会让它们一直存活——按租户、按配置动态创建 store 的用法尤其要注意。重复调用是安全的。
+
 ### 构造约束
 
 以下入口在构造期就地拒绝 nil（含装进接口的 typed-nil），而不是把 nil 解引用推迟到第一次读写：
@@ -580,11 +612,13 @@ L1 读到的数据最多陈旧 `localTTL`。这个上限由两条规则维持：
 | `persist.NewRedisStore` | `client` 为 nil |
 | `persist.NewTwoLevelStore` | `redisClient` 为 nil；`localTTL` 为零值 |
 | `persist.WithLocalStore` | `local` 为 nil |
-| `persist.WithTwoLevelInvalidationBroadcast` | `client` 为 nil、`channel` 为空 |
+| `persist.WithTwoLevelInvalidationBroadcast` | `client` 为 nil、`channel` 为空；未同时提供 `WithTwoLevelLogger` |
 | `ristrettoadapter.New` / `ristrettoadapter.WithLocalStore` | `cache` 为 nil |
 | `ristrettoadapter.WithCost` | 成本函数为 nil |
 
 `ristrettoadapter.New(nil)` 尤其需要拦：Ristretto 的方法对 nil receiver 是安全的，包一个 nil 实例不会崩，而是静默变成黑洞缓存——每次 `Set` 返回 `nil` 装作写成功，每次 `Get` 返回未命中。
+
+启用广播必须同时提供 `WithTwoLevelLogger`：订阅启动失败会让广播在该实例的生命周期内保持关闭，没有 logger 时这个降级毫无信号。
 
 按条件启用广播时用 nil Option，构造函数会跳过它：
 
