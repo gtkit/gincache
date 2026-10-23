@@ -1,4 +1,4 @@
 package freecacheadapter
 
-// Version 是尚待首次发布的模块版本。
+// Version 是本模块的版本号；发布标签带 persist/freecacheadapter/ 前缀。
 const Version = "v0.1.0"

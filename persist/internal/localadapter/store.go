@@ -271,9 +271,11 @@ func (s *Store) Stats() map[string]int64 {
 	if s == nil || s.owner == nil {
 		return map[string]int64{"closed": 1}
 	}
-	stats := map[string]int64{"hit": count(s.hits.Load()), "miss": count(s.misses.Load()),
+	stats := map[string]int64{
+		"hit": count(s.hits.Load()), "miss": count(s.misses.Load()),
 		"set": count(s.sets.Load()), "del": count(s.deletes.Load()),
-		"reject": count(s.rejects.Load()), "error": count(s.failures.Load())}
+		"reject": count(s.rejects.Load()), "error": count(s.failures.Load()),
+	}
 	if err := s.acquire(context.Background()); err != nil {
 		stats["closed"] = 1
 		return stats

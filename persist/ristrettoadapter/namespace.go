@@ -2,8 +2,9 @@
 package ristrettoadapter
 
 import (
-	"github.com/gtkit/gincache/persist/internal/localadapter"
 	"time"
+
+	"github.com/gtkit/gincache/persist/internal/localadapter"
 )
 
 // Owner 管理一个原生实例；共享消费者使用不同 namespace。

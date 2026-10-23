@@ -4,9 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
+
 	"github.com/allegro/bigcache/v3"
 	"github.com/gtkit/gincache/persist/bigcacheadapter"
-	"time"
 )
 
 func ExampleNewOwner() {

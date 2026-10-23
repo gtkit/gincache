@@ -21,7 +21,7 @@
 - [FreeCache](persist/freecacheadapter/README.md)
 - [Ristretto](persist/ristrettoadapter/README.md)
 
-主库保留通用接口，调用方决定引擎，以及业务和 HTTP 使用独立实例还是共享实例。新 Owner API 的未发布版本接入方式、完整示例和生命周期约束见下文“可选本地缓存模块”。
+主库保留通用接口，调用方决定引擎，以及业务和 HTTP 使用独立实例还是共享实例。新 Owner API 的按需安装、完整示例和生命周期约束见下文“可选本地缓存模块”。
 
 ## 特性概览
 
@@ -51,7 +51,7 @@ go get github.com/gtkit/gincache
 
 ### 2. 需要原生本地缓存时，选择一个独立适配模块
 
-BigCache、FreeCache、Ristretto 分别独立分发，不需要同时引入。新 Owner API 目前是未发布源码，按下文“可选本地缓存模块”的本地 go.mod 示例接入；版本发布后再使用相应发布版本的 go get。已有 Ristretto 旧接口继续保留，见后文兼容用法。
+BigCache、FreeCache、Ristretto 分别独立分发，不需要同时引入。按下文“可选本地缓存模块”安装所选模块；需要源码联调时再使用本地 go.mod 的 replace 示例。已有 Ristretto 旧接口继续保留，见后文兼容用法。
 
 ## 设计定位
 
@@ -818,15 +818,15 @@ stats := store.Stats()
 
 主模块只依赖现有 `persist.CacheStore`（HTTP 存储）或 `persist.LocalStore`（两级缓存 L1）契约，不强制引入原生本地引擎。三个适配器分别是独立 Go module，调用方只选择需要的一个：
 
-| 模块 | 原生引擎 | 本轮待发布模块版本 | 创建 / 借用 |
+| 模块 | 原生引擎 | 模块版本 | 创建 / 借用 |
 |---|---|---|---|
 | [persist/bigcacheadapter](persist/bigcacheadapter/README.md) | BigCache v3.2.0 | v0.1.0 | `NewOwner(ctx, cfg)` / `WrapOwner(raw, cfg)` |
 | [persist/freecacheadapter](persist/freecacheadapter/README.md) | FreeCache v1.2.7 | v0.1.0 | `NewOwner(capacityBytes)` / `WrapOwner(raw, capacityBytes)` |
 | [persist/ristrettoadapter](persist/ristrettoadapter/README.md) | Ristretto v2.4.2 | v1.2.0 | `NewOwner(cfg)` / `WrapOwner(raw, cfg)`；旧 `New` 保留 |
 
-这里的最小依赖指原生引擎之间不捆绑；主模块既有 Gin、Redis、JSON 依赖仍然存在。主模块本轮版本元数据为 v1.4.0，上表新版本尚未发布，不能将其当作已经可从代理下载的 tag。
+这里的最小依赖指原生引擎之间不捆绑；主模块既有 Gin、Redis、JSON 依赖仍然存在。主模块版本为 v1.4.0，适配模块版本见上表。每个模块使用独立的版本标签。
 
-### 按需引入：未发布源码的本地开发
+### 按需引入与本地源码联调
 
 以下只选择 FreeCache。示例目录为同级的 `cache-demo/` 与 `gincache/`；如果本机目录不同，将 `replace` 的右侧改为实际路径。这里只展示调用方的开发配置，不修改本仓正式 go.mod。
 
@@ -854,10 +854,10 @@ replace github.com/gtkit/gincache v1.4.0 => ../gincache
 replace github.com/gtkit/gincache/persist/freecacheadapter v0.1.0 => ../gincache/persist/freecacheadapter
 ```
 
-当前新版本尚未发布，上面的替换仅用于本地开发。正式发布后移除这些本地替换，再引入发布版本：
+上面的替换仅用于本地源码联调。使用发布版本时移除这些本地替换，再按需安装所选模块：
 
 ```bash
-# 仅在该版本发布后使用；不需要安装另外两个适配器。
+# 只安装所选模块，不需要安装另外两个适配器。
 go get github.com/gtkit/gincache/persist/freecacheadapter@v0.1.0
 ```
 
@@ -1076,7 +1076,7 @@ func newView(owner *cacheOwner, namespace string, ttl time.Duration) (*cacheView
 }
 ```
 
-在演示项目目录执行以下命令。命令是使用说明，本次文档更新没有执行它们：
+在演示项目目录执行以下命令：
 
 ```bash
 GOWORK=off go mod tidy
@@ -1088,7 +1088,7 @@ GOWORK=off go run . -shared=false
 GOWORK=off go run . -shared=true
 ```
 
-示例通过两次同步内存 HTTP 请求演示 gincache，不监听端口；请求全部结束后才关闭资源。正常命中时 `handler_calls=1`，但缓存准入和淘汰允许 miss，不应把命中次数当成业务保证。`readText` 遇到 miss 只打印演示标记；真实业务应向数据源回源。本次只补充文档，未编译或运行这些新增文档示例。
+示例通过两次同步内存 HTTP 请求演示 gincache，不监听端口；请求全部结束后才关闭资源。正常命中时 `handler_calls=1`，但缓存准入和淘汰允许 miss，不应把命中次数当成业务保证。`readText` 遇到 miss 只打印演示标记；真实业务应向数据源回源。发布检查已构建三种引擎的示例，并分别运行独立和共享两种模式。
 
 ### 独立与共享、键隔离
 
@@ -1166,7 +1166,7 @@ cache:
 
 若后续接入新适配器，应由调用方创建所选 Owner，并分别创建业务、HTTP namespace。HTTP 层需要接收 `persist.CacheStore` 的构造入口，复用现有 Stager 的身份绕过、Vary、响应准入和信封保护；bootstrap 需要把该入口接到资源生命周期中。原业务 `cache.Cache[T]` 若也要共享，需要另加可选存储注入并保留现有治理。直接改用视图的 Get/Set，并不等价于保留原 GetOrLoad 行为。
 
-不需要在 gin_api 再建一个导入三种引擎的集中适配包。若保留原 Ristretto 默认实现后增加 BigCache/FreeCache，应用仍会同时依赖原 Ristretto 和所选引擎；若要求应用只包含一种引擎，还须调整默认装配并移除不再使用的原生依赖。以上都是后续代码改造边界，本次文档没有实现这些注入入口。
+不需要在 gin_api 再建一个导入三种引擎的集中适配包。若保留原 Ristretto 默认实现后增加 BigCache/FreeCache，应用仍会同时依赖原 Ristretto 和所选引擎；若要求应用只包含一种引擎，还须调整默认装配并移除不再使用的原生依赖。以上都是后续代码改造边界，当前 gin_api 尚未提供这些注入入口。
 
 ## 旧 Ristretto 接口与 TwoLevelStore
 

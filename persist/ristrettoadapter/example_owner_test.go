@@ -4,9 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
+
 	"github.com/dgraph-io/ristretto/v2"
 	"github.com/gtkit/gincache/persist/ristrettoadapter"
-	"time"
 )
 
 func ExampleNewOwner() {

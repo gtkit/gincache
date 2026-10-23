@@ -2,8 +2,9 @@ package ristrettoadapter
 
 import (
 	"errors"
-	"github.com/gtkit/gincache/persist/internal/adaptertest"
 	"testing"
+
+	"github.com/gtkit/gincache/persist/internal/adaptertest"
 
 	"github.com/dgraph-io/ristretto/v2"
 	"github.com/gtkit/gincache/persist"

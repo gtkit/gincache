@@ -2,7 +2,7 @@
 
 独立可选 Go module：`github.com/gtkit/gincache/persist/ristrettoadapter`。只引入 Ristretto v2.4.2，不捆绑另外两种原生引擎；仍继承主模块已有的 Gin、Redis、JSON 依赖。
 
-本轮适配模块版本元数据为 v1.2.0，依赖主模块 v1.4.0；这些新版本尚未发布。本次只补充文档，未修改代码，也未编译或运行新增文档示例。
+本模块版本为 v1.2.0，依赖主模块 v1.4.0。下方完整示例已在发布检查中构建，并运行独立和共享两种模式。
 
 ## 按需引入
 
@@ -32,10 +32,10 @@ replace github.com/gtkit/gincache v1.4.0 => ../gincache
 replace github.com/gtkit/gincache/persist/ristrettoadapter v1.2.0 => ../gincache/persist/ristrettoadapter
 ```
 
-当前新版本尚未发布，上面的替换仅用于本地开发。正式发布后移除这些本地替换，再引入发布版本：
+上面的替换仅用于本地源码联调。使用发布版本时移除这些本地替换，再按需安装：
 
 ```bash
-# 仅在该版本发布后使用；不需要安装另外两个适配器。
+# 只安装所选模块，不需要安装另外两个适配器。
 go get github.com/gtkit/gincache/persist/ristrettoadapter@v1.2.0
 ```
 
@@ -180,7 +180,7 @@ func newView(owner *cacheOwner, namespace string, ttl time.Duration) (*cacheView
 }
 ```
 
-在演示项目目录执行以下命令。命令是使用说明，本次文档更新没有执行它们：
+在演示项目目录执行以下命令：
 
 ```bash
 GOWORK=off go mod tidy
@@ -192,7 +192,7 @@ GOWORK=off go run . -shared=false
 GOWORK=off go run . -shared=true
 ```
 
-示例通过两次同步内存 HTTP 请求演示 gincache，不监听端口；请求全部结束后才关闭资源。正常命中时 `handler_calls=1`，但缓存准入和淘汰允许 miss，不应把命中次数当成业务保证。`readText` 遇到 miss 只打印演示标记；真实业务应向数据源回源。本次只补充文档，未编译或运行这些新增文档示例。
+示例通过两次同步内存 HTTP 请求演示 gincache，不监听端口；请求全部结束后才关闭资源。正常命中时 `handler_calls=1`，但缓存准入和淘汰允许 miss，不应把命中次数当成业务保证。`readText` 遇到 miss 只打印演示标记；真实业务应向数据源回源。发布检查已构建本示例，并运行独立和共享两种模式。
 
 ## 独立与共享、键隔离
 
@@ -271,7 +271,7 @@ cache:
 
 若后续接入新适配器，应由调用方创建所选 Owner，并分别创建业务、HTTP namespace。HTTP 层需要接收 `persist.CacheStore` 的构造入口，复用现有 Stager 的身份绕过、Vary、响应准入和信封保护；bootstrap 需要把该入口接到资源生命周期中。原业务 `cache.Cache[T]` 若也要共享，需要另加可选存储注入并保留现有治理。直接改用视图的 Get/Set，并不等价于保留原 GetOrLoad 行为。
 
-不需要在 gin_api 再建一个导入三种引擎的集中适配包。若保留原 Ristretto 默认实现后增加 BigCache/FreeCache，应用仍会同时依赖原 Ristretto 和所选引擎；若要求应用只包含一种引擎，还须调整默认装配并移除不再使用的原生依赖。以上都是后续代码改造边界，本次文档没有实现这些注入入口。
+不需要在 gin_api 再建一个导入三种引擎的集中适配包。若保留原 Ristretto 默认实现后增加 BigCache/FreeCache，应用仍会同时依赖原 Ristretto 和所选引擎；若要求应用只包含一种引擎，还须调整默认装配并移除不再使用的原生依赖。以上都是后续代码改造边界，当前 gin_api 尚未提供这些注入入口。
 
 ## 相关说明
 

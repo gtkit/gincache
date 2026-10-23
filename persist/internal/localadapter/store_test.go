@@ -25,6 +25,7 @@ func (e *memoryEngine) Get(key string) ([]byte, error) {
 	}
 	return slices.Clone(value), nil
 }
+
 func (e *memoryEngine) Set(key string, value []byte, _ time.Duration) (bool, error) {
 	e.values[key] = slices.Clone(value)
 	return true, nil

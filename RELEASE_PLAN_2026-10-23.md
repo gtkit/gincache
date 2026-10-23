@@ -1,6 +1,6 @@
 # 可选缓存适配模块发布计划
 
-日期：2026-10-23。状态：改造已提交并推送，等待发布门禁处理方式确认；尚未创建或推送本轮标签。
+日期：2026-10-23。状态：发布检查已完成，仅豁免两个已记录的旧失败；正在准备版本文档，尚未创建或推送本轮标签。
 
 ## 来源、范围和当前事实
 
@@ -36,7 +36,7 @@
 | 阶段 | 前置条件与步骤 | 可复核证据 | 停止条件 | 当前状态 |
 |---|---|---|---|---|
 | R1 提交与推送 | 读取规则、原计划、旧失败记录、当前 diff 和远端引用；回读本计划；按明确文件清单提交；正常推送 main | 暂存文件清单、commit SHA、push 返回及远端 main SHA | 非预期文件、并行改动、远端前移、认证或 hook 拒绝 | 已完成，见下方实际记录 |
-| R2 发布门禁决定 | 功能已完成；受控检查须用户单独授权。先说明旧失败与尚缺证据；由用户决定补跑发布门禁及旧失败例外，或明确采用现有范围检查作为发布依据 | 用户明确指令；获准后记录真实命令、退出码和被接受的例外 | 未获得对应检查授权或发布例外；新失败未经处理 | 待确认，不自动运行 |
+| R2 发布门禁决定 | 功能已完成；受控检查须用户单独授权。先说明旧失败与尚缺证据；由用户决定补跑发布门禁及旧失败例外，或明确采用现有范围检查作为发布依据 | 用户明确指令；获准后记录真实命令、退出码和被接受的例外 | 未获得对应检查授权或发布例外；新失败未经处理 | 已完成，仅两个旧失败获准豁免 |
 | R3 主模块发布 | R2 条件满足；将 CHANGELOG 的 Unreleased 归入 1.4.0 和实际发布日期，同步 README 发布状态，提交并推送；确认工作区干净及远端标签不存在后创建附注标签并正常推送 | 版本常量、CHANGELOG、标签类型及解引用 SHA、远端引用 | 门禁未满足、版本或文档不一致、已有同名远端标签 | 待执行 |
 | R4 子模块发布 | 主模块 v1.4.0 已可解析；按实际下载结果补齐子模块 go.sum，不升级依赖；将三份 CHANGELOG 归入对应版本并同步 README，提交并推送；创建三个带路径前缀的附注标签 | 每个模块的真实解析结果、锁文件 diff、版本与标签对应关系、远端引用 | 主模块不可解析、依赖意外变化、标签冲突 | 待执行 |
 | R5 交付核对 | 所有拟发布引用已推送；核对远端指向和安装解析结果，报告已完成与未完成事项；GitHub Release 页面与 Go 模块标签发布分开记录 | GitHub commit/tag 链接、模块解析证据；页面未创建时明确说明 | 无法核实的结果不得报告成功 | 待执行 |
@@ -60,5 +60,44 @@
 - `git commit` 成功，提交为 `bca70090c7ad68a72e8c188c7e1deb2a8e8b9d75`，标题为“feat(cache): 添加按需引入的本地缓存适配器”。
 - `git push gtkit main` 退出 0；随后 `git ls-remote --heads gtkit main` 确认远端指向上述 SHA，工作区干净。
 - GitHub API 查询上述提交的 check-runs 仍返回 0，没有可据此认定 CI 通过的记录。
-- 已询问用户：补跑剩余发布检查并仅豁免两个旧失败，或明确采用已有受影响范围检查作为发布依据，或暂不发版。尚未获得选择，R2–R5 不执行。
+- 用户已选择“补跑剩余发布检查，仅豁免两个已记录的旧失败；其余通过后发版”。本次可继续 R2–R5，任何新增失败均不在豁免范围。
 - 尚未创建本轮标签或 GitHub Release；README 与 CHANGELOG 继续明确标为未发布。
+
+## R2 获准的执行明细
+
+1. 使用已核实的本机 Go 1.27.3、golangci-lint 2.15.0、gofumpt 0.12.0、gosec 2.29.0、已有 apidiff 和 M5 使用的 govulncheck 1.9.0，不安装或更新工具，不使用容器。
+2. 主模块补跑全范围 build、vet、lint、modern、race 与 atomic 覆盖率；仅用 Go 的 `-skip` 精确排除 `TestTwoLevelStoreBackfillDoesNotResurrectMutatedKey/(Delete|DeletePattern)_之后不复活`，保留同组另外两个子用例。例外原样记录，不删除测试或削弱断言。
+3. 主模块及三个子模块补齐 tidy-diff、模块校验、gofumpt、gosec、benchmark 和依赖解析；主模块完整范围补跑 govulncheck。三个子模块 M5 已通过的普通测试、build、vet、lint、modern、race 与覆盖率结果可复用，正式发布依赖解析后仍需以最终模块文件作安装/构建核对。
+4. 子模块发布前使用临时 modfile 指向本地主模块；发布后改用真实 v1.4.0 解析并补齐正式 go.sum。临时 replace 仅存在于项目外的证据目录，不进入正式 go.mod。
+5. 对主模块和 persist 包与 v1.3.1、Ristretto 与其 v1.1.0 标签进行 apidiff；基线在临时目录导出，禁止改动既有标签。新模块无旧 API 基线。
+6. 从主 README 和三个子模块 README 提取完整示例，在项目外的临时调用方模块中构建并运行独立/共享实例场景；示例使用 httptest 同步请求，不监听端口、不连接业务服务。所有日志、命令、退出码、豁免用例和覆盖率口径均保存到临时证据目录并在本文件记录摘要。
+7. 任何新增失败先记录错误，区分本次改动、旧问题或工具环境问题；需要源码修正时先补齐具体计划再改。新增问题未处理或未获例外时不发版。
+
+### R2 首轮结果与最小修正计划
+
+证据目录：`/var/folders/_w/xwv4k3t12vn9054592gsk5200000gn/T/gincache-release-20261023-w970dfl5`。
+
+- 主模块 build/vet/lint/modern/gosec/govulncheck、排除两个指定旧子用例的 race、benchmark 均 exit 0。覆盖率工具显示整体 80.0%；扫描无可达漏洞，仍提示一个仅依赖模块层面的公告。
+- 四个模块 `go mod verify` 和三个适配器 gosec 均 exit 0。六份 README 组合程序已构建成功，运行场景待执行。
+- `go mod tidy -diff` 发现主模块 go.sum 有旧版本残留并缺少当前依赖测试所需的 yaml 校验和；三个子模块 go.sum 的 testify 版本排序不符合 Go 规范，Ristretto 另有旧主模块校验和。四个 go.mod 的依赖版本无变更需求。分别记录 ERR-20261023-108/110/111/112。
+- gofumpt 报告的 10 个文件均来自本次适配实现：BigCache 的 example_owner_test.go、namespace.go、owner_test.go；FreeCache 的 namespace.go；internal/adaptertest/contract.go；internal/localadapter/store.go、store_test.go；Ristretto 的 example_owner_test.go、namespace.go、owner_test.go。差异仅为导入分组、声明分组、换行与尾逗号，未发现行为差异，记录 ERR-20261023-109。
+- apidiff 的 persist 和 Ristretto 比较无不兼容项；主包唯一输出为 Version 值从旧标签内的 v1.3.0 变为计划的 v1.4.0。此项是明确授权的版本元数据更新，不是函数或类型契约破坏；需逐字核对该唯一输出，不忽略其他差异，记录 ERR-20261023-113。
+
+修正步骤（不改接口或运行行为）：
+1. 先保存上述 10 个源码文件及四个模块文件的原始哈希与内容；仅对已列明文件运行既有格式化入口，回读实际 diff，出现清单外变化即停止。
+2. 主模块按实际 tidy 结果整理 go.sum；子模块使用临时 modfile 整理校验和再同步 go.sum。逐个确认 go.mod 和所选依赖版本未变，正式 go.mod 不添加 replace。主模块实际发布后，再补齐其真实 v1.4.0 校验和。
+3. 复验 gofumpt、四模块 tidy/verify，以及受格式化影响的内核/适配模块测试、build、vet、lint、modern、race 与覆盖率；执行剩余示例和子模块 benchmark。新输出继续记录，任何新增语义变更或失败阻断发布。
+4. 这些修正均可用保存的原始文件逐个恢复；不碰两个旧用例、历史适配器或其他业务代码，不修改 OpenSpec。
+
+复验补充：普通 tidy 未重排 BigCache/FreeCache 已有的 testify 校验和，`tidy -diff` 仍给出同一排序差异（ERR-20261023-114/115）。仅按该已读取 diff 将已有七行按 v1.3.0、v1.7.1、v1.8.0、v1.8.4、v1.10.0、v1.12.1 顺序排列，哈希原文不变；同步临时 modfile 对应的 sum，再复验 tidy-diff。此项不新增、删除或升级依赖。
+
+### R2 最终结果
+
+- 主模块全范围 build/vet/lint/modern/gosec/govulncheck、race 与 benchmark 已通过；race 仅跳过明确授权的两个旧子用例。主模块总覆盖率为 80.0%（go tool cover 的汇总口径），公共内核为 81.3%。
+- 格式修正后，内核及三个适配模块再次通过 build/vet/lint/modern/race；BigCache/FreeCache/Ristretto 覆盖率分别为 92.1%/94.3%/85.7%。各模块 benchmark 命令 exit 0；适配模块本身没有 Benchmark 函数，不据此声称其原生引擎性能已测定。
+- 四模块 tidy-diff 和 verify 通过（子模块此时仍使用项目外的本地 modfile），全仓 gofumpt 无输出；四份 go.mod 未变，不新增原生依赖或升级版本。
+- 主 README 的三种组合与三个子 README 的单文件程序均构建成功，共 12 个独立/共享场景运行成功；每个场景均输出隔离的业务/HTTP 值，handler_calls=1。
+- API 比较已逐条审阅：除已授权 Version 常量变化外，主包、persist 和旧 Ristretto 契约无不兼容输出。
+- 三个子模块覆盖率报告初次在主模块 cwd 读取失败（ERR-116/117/118），已在正确子模块目录和对应 modfile 下重新取得；不影响先前实际测试结果。ERR-108 至 ERR-118 已按各自真实结果关闭，ERR-098 继续保留。
+- 证据包含 root-checks-results.json、final-affected-checks-results.json、final-records-results.json、module-coverage-records-results.json、example-runs-results.json、api-review.json 与 release-check-summary.json。首次失败记录不删除，最终结果以上述明确复验为准。
+- 仓库未跟踪 GitHub Actions 工作流，check-runs 查询无记录；没有可等待的已配置 CI，不宣称远端 CI 通过。按现有根 Makefile 的本地门禁口径和用户明确的两个旧失败例外继续发布；不直接调用会再次运行未豁免旧测试的聚合 tag 目标。

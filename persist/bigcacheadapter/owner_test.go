@@ -12,8 +12,10 @@ import (
 )
 
 func bigConfig() bigcache.Config {
-	return bigcache.Config{Shards: 16, HardMaxCacheSize: 16, LifeWindow: time.Hour,
-		MaxEntriesInWindow: 256, MaxEntrySize: 512}
+	return bigcache.Config{
+		Shards: 16, HardMaxCacheSize: 16, LifeWindow: time.Hour,
+		MaxEntriesInWindow: 256, MaxEntrySize: 512,
+	}
 }
 
 func TestBigCacheContract(t *testing.T) {

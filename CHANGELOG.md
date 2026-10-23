@@ -5,12 +5,24 @@
 ## [Unreleased]
 
 ### Added
-- 新增可选 BigCache、FreeCache 独立适配模块，并为 Ristretto 添加兼容旧接口的 Owner/namespace 视图；主模块不增加原生引擎依赖。相关版本尚未发布。
 ### Changed
 ### Deprecated
 ### Removed
 ### Fixed
 ### Security
+
+## [1.4.0] - 2026-10-23
+
+### Added
+
+- 新增可选 BigCache、FreeCache 独立适配模块，并为 Ristretto 添加兼容旧接口的 Owner/namespace 视图；主模块不增加原生引擎依赖。
+- 补充按需引入、独立和共享实例的完整示例，以及 TTL、容量、键隔离、生命周期和 gin_api 当前接入限制。
+
+### Changed
+
+- Redis 客户端依赖更新至 v9.23.0，并整理当前依赖版本的校验和。
+
+> 验证限制：本次发布按调用方确认，仅豁免已记录的 `TestTwoLevelStoreBackfillDoesNotResurrectMutatedKey` 下 Delete 与 DeletePattern 两个旧失败场景；本版不包含这两个问题的修复。其余发布检查通过，完整记录见 `RELEASE_PLAN_2026-10-23.md`。
 
 ## [1.3.0] - 2026-08-13
 

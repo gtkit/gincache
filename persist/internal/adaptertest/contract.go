@@ -12,9 +12,11 @@ import (
 	"github.com/gtkit/gincache/persist/internal/localadapter"
 )
 
-type Owner = localadapter.Owner
-type Store = localadapter.Store
-type Option = localadapter.Option
+type (
+	Owner  = localadapter.Owner
+	Store  = localadapter.Store
+	Option = localadapter.Option
+)
 
 var (
 	WithClock             = localadapter.WithClock
