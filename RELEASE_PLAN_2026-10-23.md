@@ -1,8 +1,8 @@
 # 可选缓存适配模块发布计划
 
-日期：2026-10-23。状态：主模块 v1.4.0 已发布且下载验证通过；三个子模块已完成真实依赖复核，准备推送其独立标签。仅豁免两个已记录的旧失败。
+日期：2026-10-23。状态：主模块与三个子模块已通过附注标签发布并推送到 GitHub，发布版本的按需安装及独立/共享示例均验证通过。仅豁免两个已记录的旧失败。
 
-## 来源、范围和当前事实
+## 来源、范围和发布准备前事实
 
 用户最新指令为“提交，发版并 push 到 GitHub”。本计划在已完成的
 `CACHE_ADAPTERS_MINIMAL_PLAN_2026-10-23.md` 基础上追加发布步骤，不改变原有功能、接口、目录或依赖方向。
@@ -38,11 +38,11 @@
 | R1 提交与推送 | 读取规则、原计划、旧失败记录、当前 diff 和远端引用；回读本计划；按明确文件清单提交；正常推送 main | 暂存文件清单、commit SHA、push 返回及远端 main SHA | 非预期文件、并行改动、远端前移、认证或 hook 拒绝 | 已完成，见下方实际记录 |
 | R2 发布门禁决定 | 功能已完成；受控检查须用户单独授权。先说明旧失败与尚缺证据；由用户决定补跑发布门禁及旧失败例外，或明确采用现有范围检查作为发布依据 | 用户明确指令；获准后记录真实命令、退出码和被接受的例外 | 未获得对应检查授权或发布例外；新失败未经处理 | 已完成，仅两个旧失败获准豁免 |
 | R3 主模块发布 | R2 条件满足；将 CHANGELOG 的 Unreleased 归入 1.4.0 和实际发布日期，同步 README 发布状态，提交并推送；确认工作区干净及远端标签不存在后创建附注标签并正常推送 | 版本常量、CHANGELOG、标签类型及解引用 SHA、远端引用 | 门禁未满足、版本或文档不一致、已有同名远端标签 | 已完成，含真实下载和校验 |
-| R4 子模块发布 | 主模块 v1.4.0 已可解析；按实际下载结果补齐子模块 go.sum，不升级依赖；将三份 CHANGELOG 归入对应版本并同步 README，提交并推送；创建三个带路径前缀的附注标签 | 每个模块的真实解析结果、锁文件 diff、版本与标签对应关系、远端引用 | 主模块不可解析、依赖意外变化、标签冲突 | 已完成依赖复核，待推送标签 |
-| R5 交付核对 | 所有拟发布引用已推送；核对远端指向和安装解析结果，报告已完成与未完成事项；GitHub Release 页面与 Go 模块标签发布分开记录 | GitHub commit/tag 链接、模块解析证据；页面未创建时明确说明 | 无法核实的结果不得报告成功 | 待执行 |
+| R4 子模块发布 | 主模块 v1.4.0 已可解析；按实际下载结果补齐子模块 go.sum，不升级依赖；将三份 CHANGELOG 归入对应版本并同步 README，提交并推送；创建三个带路径前缀的附注标签 | 每个模块的真实解析结果、锁文件 diff、版本与标签对应关系、远端引用 | 主模块不可解析、依赖意外变化、标签冲突 | 已完成，三个附注标签已推送 |
+| R5 交付核对 | 所有拟发布引用已推送；核对远端指向和安装解析结果，报告已完成与未完成事项；GitHub Release 页面与 Go 模块标签发布分开记录 | GitHub commit/tag 链接、模块解析证据；页面未创建时明确说明 | 无法核实的结果不得报告成功 | 已完成实际安装和运行验证 |
 
 发布检查按实际脚本及项目规则拆开执行，不通过聚合入口间接运行尚未授权的 vet、lint、modern、race 或覆盖率检查。
-当前 README 和 CHANGELOG 保持“未发布”事实；完成对应发布阶段时再更新，不提前宣称标签或 GitHub Release 已存在。
+README 和 CHANGELOG 已随发布阶段更新；是否发布以实际远端标签与下方执行记录为准。
 
 ## 风险、失败处理与回滚
 
@@ -52,16 +52,16 @@
 - 已推送 commit 的撤销通过后续经授权的 revert；已公开 Go 模块标签不可回收，发布错误用新 PATCH 修正。
 - 发布前尚未对外的文档变动可用对应 diff 回退；不使用 reset --hard、clean，不覆盖其他工作区改动。
 
-## 实际执行记录
+## R1 实际执行记录
 
 - 已读取规则、原实施计划与旧失败记录，已核对本地/远端 main、现有标签和版本常量。
-- 本轮尚未执行测试、构建、vet、lint、modern、race、覆盖率、benchmark、安全扫描或 OpenSpec 操作。
+- R1 阶段未执行测试、构建、vet、lint、modern、race、覆盖率、benchmark、安全扫描或 OpenSpec 操作；后续获准检查的实际结果见 R2。
 - `git diff --cached --check` 无输出，退出 0；提交清单为 48 个文件，含已有工作区依赖与锁文件更新。未修改旧 persist 实现及旧 Ristretto adapter.go。
 - `git commit` 成功，提交为 `bca70090c7ad68a72e8c188c7e1deb2a8e8b9d75`，标题为“feat(cache): 添加按需引入的本地缓存适配器”。
 - `git push gtkit main` 退出 0；随后 `git ls-remote --heads gtkit main` 确认远端指向上述 SHA，工作区干净。
 - GitHub API 查询上述提交的 check-runs 仍返回 0，没有可据此认定 CI 通过的记录。
 - 用户已选择“补跑剩余发布检查，仅豁免两个已记录的旧失败；其余通过后发版”。本次可继续 R2–R5，任何新增失败均不在豁免范围。
-- 尚未创建本轮标签或 GitHub Release；README 与 CHANGELOG 继续明确标为未发布。
+- R1 阶段尚未创建本轮标签或 GitHub Release；当时 README 与 CHANGELOG 继续明确标为未发布。
 
 ## R2 获准的执行明细
 
@@ -108,10 +108,27 @@
 - 已创建并推送附注标签 v1.4.0。标签对象为 `496da6981b9ee271019d09edccf593ec285c0e39`，解引用到上述发布准备提交；Git ls-remote 和 GitHub API 均已核对。
 - 首次使用公共代理连接超时（ERR-119）；恢复本机代理后 Git HTTPS 回源等待，终止该次下载并仅为后续命令使用已验证的 GitHub SSH 传输（ERR-120）。Go 已读取新标签并确认相同 Origin.Hash，但镜像校验和查询返回 unknown revision（ERR-121）。
 - 官方 sum.golang.org 及其中国别名连接超时（ERR-122/123）；本机 goproxy.cn 和另一个镜像查询仍返回相同新标签不可用。保持 sumdb 校验，没有关闭验证或改用户全局配置，也没有重打已发布标签。
-- 官方服务文档 https://proxy.golang.org/ 说明：在标签发布前请求过版本时，负缓存最长可能需要 30 分钟刷新。正在等待镜像识别新版本；R4 仍须以实际模块下载和校验结果为前提。
+- 官方服务文档 https://proxy.golang.org/ 说明：在标签发布前请求过版本时，负缓存最长可能需要 30 分钟刷新。当时先等待镜像识别新版本，未跳过实际模块下载和校验。
 
 随后镜像已返回成功。`published-root-download-final` 在保持 sumdb 校验的情况下 exit 0，Origin.Hash 与标签提交相同；主模块 zip 与 go.mod 的 h1 已取得。发布归档包含共享内核并排除三个嵌套模块，其关键文件逐项与标签内容一致。ERR-119 至 ERR-123 已关闭；等待脚本状态解析错误 ERR-124 也已修正并关闭。
 
 ### R4 实际依赖复核
 
 三个正式 go.sum 各增加真实主模块 v1.4.0 的两条校验和，go.mod 未变。关闭本地 replace 后，各模块重新通过 tidy-diff、verify、build 和普通测试；go list 显示依赖来自缓存中的正式 v1.4.0，各模块依赖图仅含对应原生引擎。证据为 published-dependencies-results.json、published-dependency-boundaries.json。三个适配器的源码与已通过 race 的版本相同，当前仅补齐发布校验和。
+
+提交 `1c497b7fb02f32ec7fdfe5ae4f74fe549604e779` 包含上述锁文件补齐及发布记录。三个子模块标签与 main 已原子推送；每个标签均为附注标签，解引用到该提交。主模块标签仍指向 `1b8c39fdc7f078f57431f330a3aef497160a8d58`，未覆盖已推送标签。
+
+### R5 发布结果
+
+| 模块 | 已推送标签 | 安装及运行 |
+|---|---|---|
+| 主模块 | v1.4.0 | 实际下载、sumdb 校验和归档内容核对通过 |
+| BigCache | persist/bigcacheadapter/v0.1.0 | 无 replace 的 go get、build、独立/共享示例均通过 |
+| FreeCache | persist/freecacheadapter/v0.1.0 | 无 replace 的 go get、build、独立/共享示例均通过 |
+| Ristretto | persist/ristrettoadapter/v1.2.0 | 无 replace 的 go get、build、独立/共享示例均通过 |
+
+- 发布版本在三个全新调用方模块中各自安装。每个依赖图只包含所选原生引擎，两个 namespace 返回各自的值，HTTP 示例每次运行的 handler_calls 均为 1。
+- 四个远端标签对象类型及解引用提交已逐个核对；三个适配包的归档关键文件与各自标签内容一致。
+- 发布后证据包括 published-tags.json、adapter-artifact-inspection.json、release-installs-results.json、installed-builds-results.json、installed-runs-results.json、installed-release-proof.json。
+- 本次按项目的 Git 标签流程发布 Go 模块，没有另行创建 GitHub Release 页面。
+- 两个旧测试失败仍记在 ERR-20261023-098，未改写源码或测试、未扩大豁免范围。发布期间发现的格式、锁文件和工具环境问题均已处置；未修改 gin_api、OpenSpec、全局工具或用户配置。
