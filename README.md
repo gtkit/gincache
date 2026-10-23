@@ -15,16 +15,13 @@
 - `TwoLevelStore`
 - `LocalStore` 可插拔本地缓存接口
 
-当前主模块**不再内置** `Ristretto` 适配代码。  
-如果你需要 `Ristretto`，请使用可选子模块：
+主模块不内置 BigCache、FreeCache、Ristretto 原生引擎。需要时按需引入一个独立适配模块：
 
-- `github.com/gtkit/gincache/persist/ristrettoadapter`
+- [BigCache](persist/bigcacheadapter/README.md)
+- [FreeCache](persist/freecacheadapter/README.md)
+- [Ristretto](persist/ristrettoadapter/README.md)
 
-这样做的目的很直接：
-
-- 主库继续保持轻量风格
-- `TwoLevelStore` 保留扩展点
-- 想用 `Ristretto` 的项目再显式引入
+主库保留通用接口，调用方决定引擎，以及业务和 HTTP 使用独立实例还是共享实例。新 Owner API 的未发布版本接入方式、完整示例和生命周期约束见下文“可选本地缓存模块”。
 
 ## 特性概览
 
@@ -52,11 +49,9 @@
 go get github.com/gtkit/gincache
 ```
 
-### 2. 如果你要接入 Ristretto，再额外安装可选子模块
+### 2. 需要原生本地缓存时，选择一个独立适配模块
 
-```bash
-go get github.com/gtkit/gincache/persist/ristrettoadapter
-```
+BigCache、FreeCache、Ristretto 分别独立分发，不需要同时引入。新 Owner API 目前是未发布源码，按下文“可选本地缓存模块”的本地 go.mod 示例接入；版本发布后再使用相应发布版本的 go get。已有 Ristretto 旧接口继续保留，见后文兼容用法。
 
 ## 设计定位
 
@@ -68,10 +63,8 @@ go get github.com/gtkit/gincache/persist/ristrettoadapter
 2. 主模块 `persist`
 只保留轻量、通用、无强外部依赖的存储抽象与实现。
 
-3. 可选子模块 `persist/ristrettoadapter`
-当你确实需要热点本地缓存、容量控制、内存上限时，再显式引入 `Ristretto`。
-
-这比把 `Ristretto` 直接揉进主模块更符合轻量级 Go 库的风格。
+3. 可选子模块 `persist/bigcacheadapter`、`persist/freecacheadapter`、`persist/ristrettoadapter`
+当需要有界原生本地缓存时，调用方显式引入所选模块。共享实现留在 internal，原生引擎依赖留在各自的独立 module。
 
 ## 项目目录结构
 
@@ -101,13 +94,14 @@ gincache/
 │  │  └─ 两级缓存回归测试
 │  ├─ twolevel_localstore_test.go
 │  │  └─ 本地缓存注入测试
+│  ├─ internal/
+│  │  └─ localadapter/、adaptertest/：共享内核与测试辅助
+│  ├─ bigcacheadapter/
+│  │  └─ 独立 go.mod、Owner 适配、测试与 README
+│  ├─ freecacheadapter/
+│  │  └─ 独立 go.mod、Owner 适配、测试与 README
 │  └─ ristrettoadapter/
-│     ├─ go.mod
-│     │  └─ 可选子模块，单独维护依赖
-│     ├─ adapter.go
-│     │  └─ Ristretto 适配器实现
-│     └─ adapter_test.go
-│        └─ Ristretto 适配器测试
+│     └─ 独立 go.mod、旧 adapter.go、新 Owner API、测试与 README
 ├─ docs/
 │  └─ superpowers/
 │     ├─ specs/
@@ -820,7 +814,363 @@ stats := store.Stats()
 // local_hit_rate
 ```
 
-## 可选模块：Ristretto 接入
+## 可选本地缓存模块
+
+主模块只依赖现有 `persist.CacheStore`（HTTP 存储）或 `persist.LocalStore`（两级缓存 L1）契约，不强制引入原生本地引擎。三个适配器分别是独立 Go module，调用方只选择需要的一个：
+
+| 模块 | 原生引擎 | 本轮待发布模块版本 | 创建 / 借用 |
+|---|---|---|---|
+| [persist/bigcacheadapter](persist/bigcacheadapter/README.md) | BigCache v3.2.0 | v0.1.0 | `NewOwner(ctx, cfg)` / `WrapOwner(raw, cfg)` |
+| [persist/freecacheadapter](persist/freecacheadapter/README.md) | FreeCache v1.2.7 | v0.1.0 | `NewOwner(capacityBytes)` / `WrapOwner(raw, capacityBytes)` |
+| [persist/ristrettoadapter](persist/ristrettoadapter/README.md) | Ristretto v2.4.2 | v1.2.0 | `NewOwner(cfg)` / `WrapOwner(raw, cfg)`；旧 `New` 保留 |
+
+这里的最小依赖指原生引擎之间不捆绑；主模块既有 Gin、Redis、JSON 依赖仍然存在。主模块本轮版本元数据为 v1.4.0，上表新版本尚未发布，不能将其当作已经可从代理下载的 tag。
+
+### 按需引入：未发布源码的本地开发
+
+以下只选择 FreeCache。示例目录为同级的 `cache-demo/` 与 `gincache/`；如果本机目录不同，将 `replace` 的右侧改为实际路径。这里只展示调用方的开发配置，不修改本仓正式 go.mod。
+
+```text
+work/
+├── cache-demo/
+└── gincache/
+```
+
+`cache-demo/go.mod`：
+
+```go
+module example.com/cache-demo
+
+go 1.27
+
+require (
+	github.com/gin-gonic/gin v1.12.0
+	github.com/gtkit/gincache v1.4.0
+	github.com/gtkit/gincache/persist/freecacheadapter v0.1.0
+)
+
+replace github.com/gtkit/gincache v1.4.0 => ../gincache
+
+replace github.com/gtkit/gincache/persist/freecacheadapter v0.1.0 => ../gincache/persist/freecacheadapter
+```
+
+当前新版本尚未发布，上面的替换仅用于本地开发。正式发布后移除这些本地替换，再引入发布版本：
+
+```bash
+# 仅在该版本发布后使用；不需要安装另外两个适配器。
+go get github.com/gtkit/gincache/persist/freecacheadapter@v0.1.0
+```
+
+本仓的 [go.work.example](go.work.example) 是另一种多模块本地开发入口，不会自动生效；从仓库根显式设置 `GOWORK="$PWD/go.work.example"` 后使用。该开发 workspace 同时列出三个模块，不代表调用方生产模块需要同时依赖三种引擎。
+
+<a id="local-adapter-examples"></a>
+
+### 独立实例和共享实例：完整示例
+
+下面复制为 `main.go`，再从后面的三个 `driver.go` 中只选一个。独立与共享使用同一套调用代码，区别是创建两个 Owner 还是一个 Owner。业务和 HTTP 都使用不同 namespace。
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/gtkit/gincache"
+	"github.com/gtkit/gincache/persist"
+)
+
+func main() {
+	shared := flag.Bool("shared", false, "业务与 HTTP 是否共享一个缓存实例")
+	flag.Parse()
+	if err := run(*shared); err != nil {
+		if _, writeErr := fmt.Fprintln(os.Stderr, err); writeErr != nil {
+			os.Exit(2)
+		}
+		os.Exit(1)
+	}
+}
+
+func run(shared bool) (err error) {
+	ctx := context.Background()
+	businessOwner, err := newOwner(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, businessOwner.Close(ctx)) }()
+
+	httpOwner := businessOwner
+	if !shared {
+		httpOwner, err = newOwner(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() { err = errors.Join(err, httpOwner.Close(ctx)) }()
+	}
+
+	business, err := newView(businessOwner, "demo.business.v1", time.Minute)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, business.Close()) }()
+	responses, err := newView(httpOwner, "demo.http.v1", 30*time.Second)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, responses.Close()) }()
+
+	// 同一逻辑键在两个 namespace 中互不覆盖；零 TTL 使用各自默认值。
+	if err := business.Set("same-key", "business-value", 0); err != nil {
+		return err
+	}
+	if err := responses.Set("same-key", "http-value", 0); err != nil {
+		return err
+	}
+	businessValue, err := readText(business, "same-key")
+	if err != nil {
+		return err
+	}
+	httpValue, err := readText(responses, "same-key")
+	if err != nil {
+		return err
+	}
+
+	// 只演示公开、固定内容的 GET；不把个性化数据放进该路由。
+	router := gin.New()
+	handlerCalls := 0
+	router.GET("/public/ping", gincache.Cache(responses, 30*time.Second,
+		gincache.WithCacheableStatusCodes(http.StatusOK),
+		gincache.WithMaxBodySize(4<<10),
+		gincache.WithCacheableResponse(gincache.DefaultCacheableResponse),
+		gincache.WithCacheStrategyByRequest(func(c *gin.Context) (bool, gincache.Strategy) {
+			if c.GetHeader("Authorization") != "" || c.GetHeader("Cookie") != "" {
+				return false, gincache.Strategy{}
+			}
+			return true, gincache.Strategy{
+				CacheKey: c.Request.Method + " " + c.Request.URL.RequestURI(),
+			}
+		}),
+	), func(c *gin.Context) {
+		handlerCalls++
+		c.String(http.StatusOK, "pong")
+	})
+
+	// 两次同步内存请求，不监听端口；返回后再关闭视图和 Owner。
+	for range 2 {
+		response := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, "/public/ping", nil)
+		router.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			return fmt.Errorf("unexpected HTTP status: %d", response.Code)
+		}
+	}
+	_, err = fmt.Printf("shared=%t business=%s http=%s handler_calls=%d\n",
+		shared, businessValue, httpValue, handlerCalls)
+	return err
+}
+
+func readText(store *cacheView, key string) (string, error) {
+	var value string
+	if err := store.Get(key, &value); err != nil {
+		if errors.Is(err, persist.ErrCacheMiss) {
+			// 演示中打印标记；真实业务应在这里向数据源回源。
+			return "(cache miss)", nil
+		}
+		return "", err
+	}
+	return value, nil
+}
+```
+
+三个驱动文件是互斥的选择，不能同时放入同一个示例项目。变更驱动时同步修改 go.mod 的适配模块和对应 replace：BigCache/FreeCache 使用 v0.1.0，Ristretto 使用 v1.2.0。
+
+#### BigCache：driver.go
+
+```go
+package main
+
+import (
+	"context"
+	"time"
+
+	"github.com/allegro/bigcache/v3"
+	"github.com/gtkit/gincache/persist/bigcacheadapter"
+)
+
+type cacheOwner = bigcacheadapter.Owner
+type cacheView = bigcacheadapter.NamespaceStore
+
+func newOwner(ctx context.Context) (*cacheOwner, error) {
+	return bigcacheadapter.NewOwner(ctx, bigcache.Config{
+		Shards:             16,
+		LifeWindow:         10 * time.Minute,
+		CleanWindow:        time.Minute,
+		HardMaxCacheSize:   16, // 单位 MB，不是进程 RSS。
+		MaxEntriesInWindow: 1024,
+		MaxEntrySize:       512,
+	})
+}
+
+func newView(owner *cacheOwner, namespace string, ttl time.Duration) (*cacheView, error) {
+	return owner.NewStore(namespace, bigcacheadapter.WithStoreExpiration(ttl))
+}
+```
+
+#### FreeCache：driver.go
+
+```go
+package main
+
+import (
+	"context"
+	"time"
+
+	"github.com/gtkit/gincache/persist/freecacheadapter"
+)
+
+type cacheOwner = freecacheadapter.Owner
+type cacheView = freecacheadapter.NamespaceStore
+
+func newOwner(_ context.Context) (*cacheOwner, error) {
+	return freecacheadapter.NewOwner(16 << 20) // 每个实例 16 MiB。
+}
+
+func newView(owner *cacheOwner, namespace string, ttl time.Duration) (*cacheView, error) {
+	return owner.NewStore(namespace, freecacheadapter.WithStoreExpiration(ttl))
+}
+```
+
+#### Ristretto：driver.go
+
+```go
+package main
+
+import (
+	"context"
+	"time"
+
+	"github.com/dgraph-io/ristretto/v2"
+	"github.com/gtkit/gincache/persist/ristrettoadapter"
+)
+
+type cacheOwner = ristrettoadapter.Owner
+type cacheView = ristrettoadapter.NamespaceStore
+
+func newOwner(_ context.Context) (*cacheOwner, error) {
+	return ristrettoadapter.NewOwner(ristretto.Config[string, []byte]{
+		NumCounters: 100_000,
+		MaxCost:     16 << 20,
+		BufferItems: 64,
+	})
+}
+
+func newView(owner *cacheOwner, namespace string, ttl time.Duration) (*cacheView, error) {
+	return owner.NewStore(namespace, ristrettoadapter.WithStoreExpiration(ttl))
+}
+```
+
+在演示项目目录执行以下命令。命令是使用说明，本次文档更新没有执行它们：
+
+```bash
+GOWORK=off go mod tidy
+
+# 两个 Owner、两个原生实例，业务和 HTTP 各自一份预算。
+GOWORK=off go run . -shared=false
+
+# 一个 Owner、一个原生实例，两个 namespace 共用预算。
+GOWORK=off go run . -shared=true
+```
+
+示例通过两次同步内存 HTTP 请求演示 gincache，不监听端口；请求全部结束后才关闭资源。正常命中时 `handler_calls=1`，但缓存准入和淘汰允许 miss，不应把命中次数当成业务保证。`readText` 遇到 miss 只打印演示标记；真实业务应向数据源回源。本次只补充文档，未编译或运行这些新增文档示例。
+
+### 独立与共享、键隔离
+
+| 项目 | 独立实例：`-shared=false` | 共享实例：`-shared=true` |
+|---|---|---|
+| Owner / 原生实例 | 两个 | 一个 |
+| 示例预算 | 每个实例一份，合计两份 | 共用一份 |
+| 淘汰影响 | 相互独立 | 业务与 HTTP 可能相互挤占 |
+| namespace | 分别设置 | 必须不同 |
+| 关闭 | 分别关闭 Owner | 所有消费者退出后关闭一次 Owner |
+
+- 视图实现现有 `persist.CacheStore` 和 `persist.LocalStore`，可以用于 HTTP 中间件或 TwoLevelStore 的 L1；也提供 `GetBytes` / `SetBytes`。
+- 示例使用 `demo.business.v1` 和 `demo.http.v1`。namespace 须为非空合法 UTF-8、无 NUL、长度不超过 128 字节；同一 Owner 不允许重复绑定，关闭后也不复用该名称。
+- 物理键按 `gac2:<namespace 字节长度>:<namespace>:<逻辑键>` 隔离，并在记录中保存完整键。业务与 HTTP 即使用相同逻辑键，也不代表缓存内容互通。
+- 共享容量没有 namespace 硬配额。需要硬容量隔离时选择独立 Owner；共享实例也不会自动把业务失效转换成 HTTP 响应失效。
+- 三种引擎都是进程内缓存。共享仅发生在同一个进程，不能让多个进程或 Pod 共用同一个本地实例。
+
+### TTL 与错误语义
+
+| 写入 TTL | 含义 |
+|---|---|
+| 正数 | 本次条目的逻辑 TTL，从写入调用入口计时，包含编码和等待消耗 |
+| `0` | 回落到该视图的 `WithStoreExpiration`；未设置时默认 `0`，无逻辑期限 |
+| 负数 | 返回 `ErrInvalidArgument` |
+
+命中不续期；到达精确期限返回 `persist.ErrCacheMiss`，即使原生条目尚未回收。原生更早淘汰允许 miss，不能延长逻辑有效期。无逻辑期限不等于永不淘汰。
+
+`SetBytes` 返回 `(stored, err)`，正常准入或容量拒绝可以是 `(false, nil)`。`Set` / `SetWithContext` 遇到这种拒绝也返回 nil，因此 nil 只表示没有真实写入错误，不保证下一次 Get 一定命中。`Get` / `Set` 使用 JSON 编解码，字节接口用于无需该层 JSON 编码的值。
+
+### 生命周期与借用已有实例
+
+`NewOwner` 创建并拥有原生实例；`WrapOwner` 只借用。每个原生对象只能包装成一个 Owner，再由该 Owner 分配多个 namespace，不能为了共享把同一裸对象分别 Wrap 两次。
+
+1. 进程装配阶段创建 Owner 和视图；不要每个请求重新创建。
+2. 运行中经视图读写，不绕过 Owner 直接写入、清空或关闭原生实例。
+3. 关停时先停止新请求和后台生产者，等待所有缓存消费者退出。
+4. `Store.Close()` 只关闭该视图，不关闭共享 Owner；创建方最后调用 `Owner.Close(ctx)`。
+5. 使用 `WrapOwner` 时，Owner 关闭后原生对象仍由原创建方管理；全部使用者退出后按原生库的方式释放资源。
+
+Owner 等待操作门时响应 context；已进入的原生同步调用、Wait 或 Close 不能被 context 强制打断。Close 超时不代表原生操作已经停止，不能据此提前关闭借用对象或宣称消费者已经退出。
+
+### 容量选择与原生差异
+
+| 引擎 | 预算含义 | 需要注意 |
+|---|---|---|
+| BigCache | 正数 HardMaxCacheSize，单位 MB | LifeWindow 辅助回收；索引和临时对象另占内存，大条目可能返回原生错误 |
+| FreeCache | capacityBytes，至少 512 KiB | 单条键值约受总容量 1/1024 限制；需计入键、记录头和编码膨胀 |
+| Ristretto | 正数 MaxCost，适配器按键和完整记录字节计费 | 准入可能拒绝；新 Owner 路径等待原生屏障并核对本次记录 |
+
+示例均为每个实例约 16 MiB 的演示预算，独立模式有两份预算，共享模式共用一份。预算不等于进程 RSS；共享同一实例不能保证每个 namespace 的最低可用容量。原始 body 上限、序列化条目大小和原生预算必须分别考虑。具体约束见三个适配模块 README。
+
+借用现有对象的入口分别为 `bigcacheadapter.WrapOwner(raw, originalConfig)`、`freecacheadapter.WrapOwner(raw, originalCapacityBytes)`、`ristrettoadapter.WrapOwner(raw, originalConfig)`；参数必须来自实际创建配置，不能通过假填配置改变已创建实例的容量。
+
+<a id="gin-api-cache-integration"></a>
+
+### gin_api 当前接入限制
+
+以下描述的是已回退后的 gin_api，不是尚未实现的新接口：
+
+- `internal/pkg/cache/cache.go` 的 `cache.New[T]` 仍使用自己的 map/LRU，并提供 GetOrLoad、singleflight、TTL 抖动和回源限制；不能直接把 namespace 视图赋给它。
+- `internal/pkg/httpcache/cache.go` 的 `httpcache.New` 仍由配置选择原 Ristretto 或 Redis；`store: memory` 表示 Ristretto，不表示可以任选本地引擎。
+- `internal/platform/responsecache` 已有内部 `Factory`，但默认 bootstrap 没有传入自定义工厂；`bootstrap.Options` 当前也没有公开的缓存工厂注入字段。
+- 当前不存在 `store: bigcache` / `store: freecache` 配置。只修改 YAML 不能切换引擎，也不能让原业务缓存共享这些实例。
+
+当前有效的 memory 配置例如：
+
+```yaml
+cache:
+  enabled: true
+  store: memory             # 当前仍是原 Ristretto 装配。
+  ttl: 30s                  # 默认响应 TTL，路由可覆盖；配置上限为 10m。
+  max_body_bytes: 1048576    # 原始响应体缓存上限，非原生条目的大小承诺。
+  max_bytes: 67108864        # 当前 memory 后端的容量配置，单位字节。
+```
+
+若后续接入新适配器，应由调用方创建所选 Owner，并分别创建业务、HTTP namespace。HTTP 层需要接收 `persist.CacheStore` 的构造入口，复用现有 Stager 的身份绕过、Vary、响应准入和信封保护；bootstrap 需要把该入口接到资源生命周期中。原业务 `cache.Cache[T]` 若也要共享，需要另加可选存储注入并保留现有治理。直接改用视图的 Get/Set，并不等价于保留原 GetOrLoad 行为。
+
+不需要在 gin_api 再建一个导入三种引擎的集中适配包。若保留原 Ristretto 默认实现后增加 BigCache/FreeCache，应用仍会同时依赖原 Ristretto 和所选引擎；若要求应用只包含一种引擎，还须调整默认装配并移除不再使用的原生依赖。以上都是后续代码改造边界，本次文档没有实现这些注入入口。
+
+## 旧 Ristretto 接口与 TwoLevelStore
+
+下面的独立 Ristretto 模块继续保留旧接口兼容，使用它是可选项；自带适配的调用方不需要引入它。
 
 `Ristretto` 适配器已经从主模块拆出，放在：
 
@@ -938,6 +1288,8 @@ store := persist.NewTwoLevelStore(redisClient,
 - 业务强依赖写后全节点立即可见
 
 ### `WithWait()` 要不要开
+
+本节仅适用于旧 `ristrettoadapter.New` 接口。新 `NewOwner` 路径已经执行写入屏障，不接受旧 `WithWait` Option。
 
 默认建议：
 

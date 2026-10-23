@@ -12,3 +12,4 @@ credentials.*
 coverage/
 coverage.out
 *.log
+*.out

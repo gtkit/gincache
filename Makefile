@@ -2,7 +2,7 @@
 
 LINT_TARGETS ?= ./...
 # 独立的嵌套 module，主模块的 ./... 覆盖不到，必须单独跑。
-SUBMODULES ?= persist/ristrettoadapter
+SUBMODULES ?= persist/ristrettoadapter persist/bigcacheadapter persist/freecacheadapter
 MIN_COVERAGE ?= 80
 
 help: ## 显示可用目标

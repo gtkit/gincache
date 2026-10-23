@@ -1,0 +1,12 @@
+// 仅用于未发布源码的本地开发，不会被 Go 自动加载。
+// 在仓库根显式设置 GOWORK="$PWD/go.work.example" 后使用。
+go 1.27.3
+
+use (
+	.
+	./persist/bigcacheadapter
+	./persist/freecacheadapter
+	./persist/ristrettoadapter
+)
+
+replace github.com/gtkit/gincache v1.4.0 => .

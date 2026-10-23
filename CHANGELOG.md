@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### Added
+- 新增可选 BigCache、FreeCache 独立适配模块，并为 Ristretto 添加兼容旧接口的 Owner/namespace 视图；主模块不增加原生引擎依赖。相关版本尚未发布。
 ### Changed
 ### Deprecated
 ### Removed
