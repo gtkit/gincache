@@ -677,3 +677,176 @@ func (s uncomparableStore) SetWithContext(
 ) error {
 	return s.inner.SetWithContext(ctx, key, value, expire)
 }
+
+// TestCachedStatusMatchesFinalStatus 钉住缓存条目的状态码取 gin 最终发出的那个。
+//
+// 缺陷形态：包装器只记第一次 WriteHeader，而 gin 在写出 body 之前允许后一次覆盖
+// 前一次。先 c.Status(200) 再 c.JSON(404) 时客户端收到 404，缓存却记成 200，
+// 后续命中以 200 回放 404 的 body。
+func TestCachedStatusMatchesFinalStatus(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name       string
+		handler    gin.HandlerFunc
+		wantStatus int
+		wantHit    bool
+	}{
+		{
+			name: "先 200 后 404 不以 200 入库",
+			handler: func(c *gin.Context) {
+				c.Status(http.StatusOK)
+				c.JSON(http.StatusNotFound, gin.H{"err": "not found"})
+			},
+			wantStatus: http.StatusNotFound,
+			wantHit:    false,
+		},
+		{
+			name: "先 500 后 200 以 200 入库",
+			handler: func(c *gin.Context) {
+				c.Status(http.StatusInternalServerError)
+				c.String(http.StatusOK, "ok")
+			},
+			wantStatus: http.StatusOK,
+			wantHit:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := persist.NewMemoryStore(time.Minute)
+			t.Cleanup(func() { _ = store.Close() })
+
+			var (
+				calls    atomic.Int32
+				observed atomic.Int64
+			)
+			router := gin.New()
+			router.GET("/x",
+				CacheByRequestURI(store, time.Minute),
+				// 挂在缓存中间件内侧：它读到的是包装器报告的状态码。
+				func(c *gin.Context) {
+					c.Next()
+					observed.Store(int64(c.Writer.Status()))
+				},
+				func(c *gin.Context) {
+					calls.Add(1)
+					tt.handler(c)
+				},
+			)
+
+			first := httptest.NewRecorder()
+			router.ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/x", nil))
+			if first.Code != tt.wantStatus {
+				t.Fatalf("首次状态码 = %d, want %d", first.Code, tt.wantStatus)
+			}
+			if got := int(observed.Load()); got != tt.wantStatus {
+				t.Fatalf("内层读到的 Status() = %d, want %d", got, tt.wantStatus)
+			}
+
+			second := httptest.NewRecorder()
+			router.ServeHTTP(second, httptest.NewRequest(http.MethodGet, "/x", nil))
+			if second.Code != tt.wantStatus {
+				t.Fatalf("第二次状态码 = %d, want %d", second.Code, tt.wantStatus)
+			}
+
+			hit := second.Header().Get("X-Cache") == "HIT"
+			if hit != tt.wantHit {
+				t.Fatalf("第二次命中 = %v, want %v", hit, tt.wantHit)
+			}
+			wantCalls := int32(2)
+			if tt.wantHit {
+				wantCalls = 1
+			}
+			if got := calls.Load(); got != wantCalls {
+				t.Fatalf("handler 被调用 %d 次，want %d", got, wantCalls)
+			}
+		})
+	}
+}
+
+// errorOnlyLogger 只保留 Errorf，用来断言日志级别。
+type errorOnlyLogger struct{ *testLogger }
+
+func (errorOnlyLogger) Debugf(string, ...any) {}
+
+// TestUnusableStrategySkipsCache 钉住自定义策略给出不可用的输入时不缓存并记错误日志。
+//
+// 空 CacheKey 的缺陷形态：空键被当作普通键，所有这样的请求共用一个条目，
+// /b 命中 /a 的响应。typed-nil 的 CacheStore 走同一道"策略 bug → 跳过缓存"的闸门。
+func TestUnusableStrategySkipsCache(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name     string
+		strategy func(c *gin.Context) Strategy
+		wantLog  string
+	}{
+		{
+			name: "空 CacheKey",
+			strategy: func(*gin.Context) Strategy {
+				return Strategy{CacheDuration: 30 * time.Second}
+			},
+			wantLog: "Strategy.CacheKey is empty",
+		},
+		{
+			name: "typed-nil CacheStore",
+			strategy: func(c *gin.Context) Strategy {
+				var broken *persist.MemoryStore
+				return Strategy{CacheKey: c.Request.URL.Path, CacheStore: broken}
+			},
+			wantLog: "Strategy.CacheStore is a typed-nil",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := persist.NewMemoryStore(time.Minute)
+			t.Cleanup(func() { _ = store.Close() })
+
+			logger := errorOnlyLogger{&testLogger{}}
+			middleware := Cache(store, time.Minute,
+				WithLogger(logger),
+				WithCacheStrategyByRequest(func(c *gin.Context) (bool, Strategy) {
+					return true, tt.strategy(c)
+				}),
+			)
+
+			var calls atomic.Int32
+			router := gin.New()
+			router.GET("/a", middleware, func(c *gin.Context) {
+				calls.Add(1)
+				c.String(http.StatusOK, "A")
+			})
+			router.GET("/b", middleware, func(c *gin.Context) {
+				calls.Add(1)
+				c.String(http.StatusOK, "B")
+			})
+
+			for _, req := range []struct{ path, want string }{
+				{"/a", "A"},
+				{"/b", "B"},
+				{"/a", "A"},
+			} {
+				recorder := httptest.NewRecorder()
+				router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, req.path, nil))
+				if got := recorder.Body.String(); got != req.want {
+					t.Fatalf("%s 响应 = %q, want %q", req.path, got, req.want)
+				}
+				if got := recorder.Header().Get("X-Cache"); got != "" {
+					t.Fatalf("%s X-Cache = %q, 不应命中", req.path, got)
+				}
+			}
+
+			if got := calls.Load(); got != 3 {
+				t.Fatalf("handler 被调用 %d 次，want 3", got)
+			}
+			if got := store.Len(); got != 0 {
+				t.Fatalf("写入了 %d 个缓存条目，want 0", got)
+			}
+			if !logger.contains(tt.wantLog) {
+				t.Fatalf("没有通过 Errorf 记录 %q", tt.wantLog)
+			}
+		})
+	}
+}

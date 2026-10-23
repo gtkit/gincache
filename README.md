@@ -244,6 +244,10 @@ r.GET("/orders",
 - 缓存存储
 - 缓存 TTL
 
+返回 `true` 时 `Strategy.CacheKey` 必须非空。空键会让本次请求跳过缓存（不读也不写），
+并通过 `WithLogger` 配置的 Logger 记录一条错误日志——中间件不会替你回落到 URI，
+因为它无法得知键里本该拼入哪些维度（例如用户标识）。
+
 ### `WithOnHitCache`
 
 缓存命中回调，适合做指标统计。

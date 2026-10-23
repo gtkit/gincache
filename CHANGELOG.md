@@ -9,6 +9,10 @@
 ### Deprecated
 ### Removed
 ### Fixed
+
+- 缓存条目的状态码改为取 gin 最终发给客户端的那个。此前只记录第一次设置的状态码：handler 先 `c.Status(200)` 再 `c.JSON(404, …)` 时客户端收到 404，缓存却记成 200，后续命中以 200 回放 404 的 body；内层中间件读 `c.Writer.Status()` 同样拿到首次值。
+- `WithCacheStrategyByRequest` 返回 `true` 但 `Strategy.CacheKey` 为空时，本次请求不再读写缓存，并通过 Logger 记录错误日志。此前空键被当作普通键，所有这样的请求共用一个条目，`/b` 会命中 `/a` 的响应。
+
 ### Security
 
 ## [1.4.0] - 2026-10-23

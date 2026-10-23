@@ -62,7 +62,7 @@ type ResponseCache struct {
 
 // Strategy 缓存策略.
 type Strategy struct {
-	CacheKey      string             // 自定义缓存 Key
+	CacheKey      string             // 自定义缓存 Key；为空时本次请求不缓存，并通过 Logger 记录错误
 	CacheStore    persist.CacheStore // 可选：使用不同的存储后端
 	CacheDuration time.Duration      // 可选：覆盖默认 TTL
 }
@@ -751,6 +751,16 @@ func (m *Middleware) handle(c *gin.Context) {
 	}
 
 	cacheKey := strategy.CacheKey
+	// 空键是调用方策略的 bug。当作普通键会让所有这样的请求共用一个条目，
+	// /b 命中 /a 的响应；也不能替调用方回落到 URI——他们本该拼进的维度
+	// （例如用户标识）无从得知，猜错就是跨用户泄漏。宁可不缓存。
+	if cacheKey == "" {
+		if m.cfg.logger != nil {
+			m.cfg.logger.Errorf("gincache: Strategy.CacheKey is empty, skip cache")
+		}
+		c.Next()
+		return
+	}
 	cacheStore := m.store
 	cacheDuration := m.defaultExpire
 
@@ -1041,10 +1051,12 @@ func (m *Middleware) scheduleForget(flight string) (superseded *atomic.Bool, sto
 // ResponseWriter 包装
 // =========================================================================
 
+// cachedWriter 不自己记录状态码：Status() 由嵌入的 gin.ResponseWriter 提供。
+// gin 在写出 body 之前允许后一次 WriteHeader 覆盖前一次，自己记首次值会让缓存
+// 条目与客户端实际收到的状态码分叉（先 c.Status(200) 再 c.JSON(404) 时缓存记成 200）。
 type cachedWriter struct {
 	gin.ResponseWriter
 	body        *bytes.Buffer
-	statusCode  int
 	written     bool
 	maxBodySize int64
 	overflowed  bool
@@ -1062,7 +1074,6 @@ func getWriter(w gin.ResponseWriter, maxBodySize int64) *cachedWriter {
 	cw := writerPool.Get().(*cachedWriter)
 	cw.ResponseWriter = w
 	cw.body.Reset()
-	cw.statusCode = 0
 	cw.written = false
 	cw.maxBodySize = maxBodySize
 	cw.overflowed = false
@@ -1078,18 +1089,12 @@ func putWriter(cw *cachedWriter) {
 }
 
 func (w *cachedWriter) WriteHeader(code int) {
-	if !w.written {
-		w.statusCode = code
-		w.written = true
-	}
+	w.written = true
 	w.ResponseWriter.WriteHeader(code)
 }
 
 func (w *cachedWriter) Write(data []byte) (int, error) {
-	if !w.written {
-		w.statusCode = http.StatusOK
-		w.written = true
-	}
+	w.written = true
 	if w.shouldBuffer(len(data)) {
 		if _, err := w.body.Write(data); err != nil {
 			return 0, err
@@ -1099,23 +1104,13 @@ func (w *cachedWriter) Write(data []byte) (int, error) {
 }
 
 func (w *cachedWriter) WriteString(s string) (int, error) {
-	if !w.written {
-		w.statusCode = http.StatusOK
-		w.written = true
-	}
+	w.written = true
 	if w.shouldBuffer(len(s)) {
 		if _, err := w.body.WriteString(s); err != nil {
 			return 0, err
 		}
 	}
 	return w.ResponseWriter.WriteString(s)
-}
-
-func (w *cachedWriter) Status() int {
-	if w.statusCode == 0 {
-		return http.StatusOK
-	}
-	return w.statusCode
 }
 
 func (w *cachedWriter) shouldBuffer(nextWriteSize int) bool {
