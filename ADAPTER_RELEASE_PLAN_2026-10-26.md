@@ -1,6 +1,6 @@
 # 三个适配模块统一版本发布计划
 
-日期：2026-10-26。当前状态：版本与文档准备、三个模块发布检查全部完成，正在分别提交；尚未打标签或推送。
+日期：2026-10-26。当前状态：三个模块已分别提交，三个 v1.2.1 附注标签及 main 已成功原子推送至 GitHub；远端引用、实际安装、发布内容及构建均已核对通过。
 
 ## 来源、目标与授权边界
 
@@ -44,9 +44,9 @@ v1.2.1 是高于三个当前版本的最小共同补丁版本。BigCache、FreeC
 | R1 准备 | 已读规则、错误记录、依赖计划与远端；本计划保存回读 | 备份本轮目标文件；更新三个 Version、发布条目及四份 README；准备三份中文标签说明 | 回读 diff、版本/模块路径/日期一致；准备文件清单与快照 | 出现无关修改、目标标签已存在、需要 API 或结构变更 | 已完成 |
 | R2 授权 | 全部 R1 准备完成 | 提交具体的发布检查范围供用户单独授权 | 用户本轮明确答复；未授权项保持未执行 | 未获准受控门禁时不得提交/打标签 | 已完成，用户要求立即继续 |
 | R3 检查 | R2 明确获准 | 在三个子模块分别运行下列门禁，按各模块旧标签核对 Go 源码差异只含 Version；记录日志和退出码 | 所有获准门禁通过，覆盖率达 80%；失败日志保留 | 新失败先记录；需要范围外源码修正、安装或例外时停止依赖步骤 | 已完成 |
-| R4 分别提交 | R3 通过；逐文件回读；核对 hooks 不扩展授权；远端 main 未前移 | 分别提交 BigCache、FreeCache、Ristretto 的五个文件，再单独提交根 README/CHANGELOG/go.work.example 与两个本轮计划；不使用 git add . | 四个中文 commit、各自文件列表、工作区干净 | 暂存无关文件、hooks 拒绝、检查失效或远端分叉 | 执行中 |
-| R5 发布与推送 | R4 完成；同名标签不存在；三个模块元数据一致 | 在最终共享提交创建三个附注标签，使用三份独立中文说明；以一次正常原子 push 推送 main 和三个标签 | git cat-file 验证 tag 类型；本地解引用与 ls-remote 精确一致 | 非快进、认证失败、原子推送失败；禁止强推或覆盖标签 | 待执行 |
-| R6 发布核对 | 已推送标签可确认 | 在项目外临时目录分别解析发布模块，读取真实版本与 gincache v1.4.1 依赖，核对可安装性；将实际结果单独提交并推送为发布记录，不改动已推送标签 | Go 下载/校验、Origin 或标签提交、版本常量、最终远端状态 | 代理或网络未就绪时如实报告，不关闭 TLS/sumdb、不伪报完成 | 待执行 |
+| R4 分别提交 | R3 通过；逐文件回读；核对 hooks 不扩展授权；远端 main 未前移 | 分别提交 BigCache、FreeCache、Ristretto 的五个文件，再单独提交根 README/CHANGELOG/go.work.example 与两个本轮计划；不使用 git add . | 四个中文 commit、各自文件列表、工作区干净 | 暂存无关文件、hooks 拒绝、检查失效或远端分叉 | 已完成 |
+| R5 发布与推送 | R4 完成；同名标签不存在；三个模块元数据一致 | 在最终共享提交创建三个附注标签，使用三份独立中文说明；以一次正常原子 push 推送 main 和三个标签 | git cat-file 验证 tag 类型；本地解引用与 ls-remote 精确一致 | 非快进、认证失败、原子推送失败；禁止强推或覆盖标签 | 已完成 |
+| R6 发布核对 | 已推送标签可确认 | 在项目外临时目录分别解析发布模块，读取真实版本与 gincache v1.4.1 依赖，核对可安装性；将实际结果单独提交并推送为发布记录，不改动已推送标签 | Go 下载/校验、Origin 或标签提交、版本常量、最终远端状态 | 代理或网络未就绪时如实报告，不关闭 TLS/sumdb、不伪报完成 | 安装、比对、构建已完成；最终记录随本次提交同步 |
 
 ### R3 本次执行的具体检查
 
@@ -80,4 +80,16 @@ v1.2.1 是高于三个当前版本的最小共同补丁版本。BigCache、FreeC
 - R3 已完成：三个模块各 12 项、共 36 项实际命令全部 exit 0；tidy-diff、模块校验、build、vet、lint、modern、gofumpt、race/coverage、覆盖率汇总、benchmark 入口、gosec 和 govulncheck 均通过。modern/gofumpt 无输出，govulncheck 均输出 `No vulnerabilities found.`。命令、环境、退出码、耗时及日志路径保存为证据目录的 `release-checks.json`。
 - 真实语句覆盖率：BigCache 92.1%、FreeCache 94.3%、Ristretto 85.7%，均达到 80% 门槛。benchmark 入口成功但未输出基准条目，不据此声称测得性能数据。本轮没有运行根模块全量测试或修改既有失败。
 - 提交前已准备逐模块文件清单及哈希：证据目录 `commit-plan.json`。每个适配器只提交自己的 go.mod/go.sum/version.go/README.md/CHANGELOG.md；共用说明另行提交。
-- R4 的三个模块提交已完成：BigCache `b69e2c4cb85d098ef3250970f988517f3d1b9783`、FreeCache `0b334d65354d7d03c0826464759721f1a2300940`、Ristretto `58a8c781467505cbd8071b022774554c385b3840`。每个提交均精确包含对应模块的五个文件，提交前空白检查通过。共用文档提交及远端推送待执行。
+- R4 的三个模块提交已完成：BigCache `b69e2c4cb85d098ef3250970f988517f3d1b9783`、FreeCache `0b334d65354d7d03c0826464759721f1a2300940`、Ristretto `58a8c781467505cbd8071b022774554c385b3840`。每个提交均精确包含对应模块的五个文件，提交前空白检查通过；共用文档和远端推送结果见下方记录。
+- R4 共用文档提交已完成：`37604f9f34036b662dbf536cb0faf0ed2f0c8d55`，标题为“docs(cache): 同步三个适配模块的统一版本与发布记录”，包含根 README/CHANGELOG/go.work.example 和两个本轮计划；提交后工作区干净。
+- R5 已完成：创建三个附注标签，均指向 `37604f9f34036b662dbf536cb0faf0ed2f0c8d55`，并与 main 一次原子推送成功。BigCache 标签对象为 `e3e9d225c804211fb254b9c783cebb8fc73f9800`，FreeCache 为 `9ba20400068d07fefa3053d54b0bdbb0e0bb1b6b`，Ristretto 为 `c1b5d65c25de4b82e3dc0cc606090c3ec39b63b7`。远端对象和解引用 SHA 逐项匹配，证据见 `tags.json`、`tag-push-commands.json`、`published-refs.json`。
+- R6 首轮：BigCache 的 go get、go list、go mod download 均 exit 0，实际解析为 v1.2.1 和 gincache v1.4.1。临时核验器误将代理未返回的 Origin.Hash 视为必须字段而退出 1，记录 ERR-20261026-131。修正核验方式为：保留成功下载结果，逐文件比对已下载模块的 Go 源码和元数据与已发布提交，完成剩余模块解析；不更改源码、标签或校验安全设置。
+- R6 最终结果：三个独立临时调用方均成功安装对应模块 v1.2.1，主模块实际选择 v1.4.1；下载校验和已取得。BigCache/FreeCache/Ristretto 分别有 9/9/12 个 Go 源码及模块、说明文件与已发布提交逐字节一致，三个安装版本的外部调用方构建均 exit 0。证据为 `final-installation-commands.json`、`installed-release-proof.json`；安装目录为 `/var/folders/_w/xwv4k3t12vn9054592gsk5200000gn/T/gincache-release-install-slx08cfu`。ERR-131 已关闭，原失败记录保留。
+- 本次按现有 Go 模块方式发布三个带目录前缀的 Git 标签；未另建 GitHub Release 页面，未变更根模块 v1.4.1 标签，也未覆盖任何旧标签。最终发布记录作为单独 docs 提交同步，三个发布标签保持原提交指向。
+
+## 合规检查摘要
+
+- 三个模块各有独立中文提交，版本常量/CHANGELOG/README/标签的版本部分统一为 v1.2.1。
+- 发布检查全部通过，覆盖率均超过 80%；实际安装和构建有独立调用方证据。
+- Go 版本、module path、依赖方向和既有 API 保持；未新增依赖，gincache 最低依赖为 v1.4.1。
+- 未运行 Docker，未重跑根模块旧失败，未声称远端 CI 或未创建的 Release 页面通过/存在。
