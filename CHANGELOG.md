@@ -6,6 +6,9 @@
 
 ### Added
 ### Changed
+
+- 三个可选适配模块版本统一为 v1.2.1，主模块最低依赖统一为 v1.4.1，安装和本地联调示例同步更新。
+
 ### Deprecated
 ### Removed
 ### Fixed

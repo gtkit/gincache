@@ -824,11 +824,11 @@ stats := store.Stats()
 
 | 模块 | 原生引擎 | 模块版本 | 创建 / 借用 |
 |---|---|---|---|
-| [persist/bigcacheadapter](persist/bigcacheadapter/README.md) | BigCache v3.2.0 | v0.1.0 | `NewOwner(ctx, cfg)` / `WrapOwner(raw, cfg)` |
-| [persist/freecacheadapter](persist/freecacheadapter/README.md) | FreeCache v1.2.7 | v0.1.0 | `NewOwner(capacityBytes)` / `WrapOwner(raw, capacityBytes)` |
-| [persist/ristrettoadapter](persist/ristrettoadapter/README.md) | Ristretto v2.4.2 | v1.2.0 | `NewOwner(cfg)` / `WrapOwner(raw, cfg)`；旧 `New` 保留 |
+| [persist/bigcacheadapter](persist/bigcacheadapter/README.md) | BigCache v3.2.0 | v1.2.1 | `NewOwner(ctx, cfg)` / `WrapOwner(raw, cfg)` |
+| [persist/freecacheadapter](persist/freecacheadapter/README.md) | FreeCache v1.2.7 | v1.2.1 | `NewOwner(capacityBytes)` / `WrapOwner(raw, capacityBytes)` |
+| [persist/ristrettoadapter](persist/ristrettoadapter/README.md) | Ristretto v2.4.2 | v1.2.1 | `NewOwner(cfg)` / `WrapOwner(raw, cfg)`；旧 `New` 保留 |
 
-这里的最小依赖指原生引擎之间不捆绑；主模块既有 Gin、Redis、JSON 依赖仍然存在。主模块版本为 v1.4.0，适配模块版本见上表。每个模块使用独立的版本标签。
+这里的最小依赖指原生引擎之间不捆绑；主模块既有 Gin、Redis、JSON 依赖仍然存在。主模块版本为 v1.4.1，适配模块版本见上表。每个模块使用独立的版本标签。
 
 ### 按需引入与本地源码联调
 
@@ -849,20 +849,20 @@ go 1.27
 
 require (
 	github.com/gin-gonic/gin v1.12.0
-	github.com/gtkit/gincache v1.4.0
-	github.com/gtkit/gincache/persist/freecacheadapter v0.1.0
+	github.com/gtkit/gincache v1.4.1
+	github.com/gtkit/gincache/persist/freecacheadapter v1.2.1
 )
 
-replace github.com/gtkit/gincache v1.4.0 => ../gincache
+replace github.com/gtkit/gincache v1.4.1 => ../gincache
 
-replace github.com/gtkit/gincache/persist/freecacheadapter v0.1.0 => ../gincache/persist/freecacheadapter
+replace github.com/gtkit/gincache/persist/freecacheadapter v1.2.1 => ../gincache/persist/freecacheadapter
 ```
 
 上面的替换仅用于本地源码联调。使用发布版本时移除这些本地替换，再按需安装所选模块：
 
 ```bash
 # 只安装所选模块，不需要安装另外两个适配器。
-go get github.com/gtkit/gincache/persist/freecacheadapter@v0.1.0
+go get github.com/gtkit/gincache@v1.4.1 github.com/gtkit/gincache/persist/freecacheadapter@v1.2.1
 ```
 
 本仓的 [go.work.example](go.work.example) 是另一种多模块本地开发入口，不会自动生效；从仓库根显式设置 `GOWORK="$PWD/go.work.example"` 后使用。该开发 workspace 同时列出三个模块，不代表调用方生产模块需要同时依赖三种引擎。
@@ -993,7 +993,7 @@ func readText(store *cacheView, key string) (string, error) {
 }
 ```
 
-三个驱动文件是互斥的选择，不能同时放入同一个示例项目。变更驱动时同步修改 go.mod 的适配模块和对应 replace：BigCache/FreeCache 使用 v0.1.0，Ristretto 使用 v1.2.0。
+三个驱动文件是互斥的选择，不能同时放入同一个示例项目。变更驱动时同步修改 go.mod 的适配模块和对应 replace：三个适配模块统一使用 v1.2.1。
 
 #### BigCache：driver.go
 

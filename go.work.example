@@ -9,4 +9,4 @@ use (
 	./persist/ristrettoadapter
 )
 
-replace github.com/gtkit/gincache v1.4.0 => .
+replace github.com/gtkit/gincache v1.4.1 => .
