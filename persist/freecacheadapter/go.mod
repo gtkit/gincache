@@ -4,7 +4,7 @@ go 1.27
 
 require (
 	github.com/coocood/freecache v1.2.7
-	github.com/gtkit/gincache v1.4.0
+	github.com/gtkit/gincache v1.4.1
 )
 
 require (
