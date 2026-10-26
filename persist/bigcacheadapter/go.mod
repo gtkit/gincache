@@ -4,7 +4,7 @@ go 1.27
 
 require (
 	github.com/allegro/bigcache/v3 v3.2.0
-	github.com/gtkit/gincache v1.4.0
+	github.com/gtkit/gincache v1.4.1
 )
 
 require (
