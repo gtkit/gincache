@@ -2,7 +2,7 @@
 
 独立可选 Go module：`github.com/gtkit/gincache/persist/ristrettoadapter`。只引入 Ristretto v2.4.2，不捆绑另外两种原生引擎；仍继承主模块已有的 Gin、Redis、JSON 依赖。
 
-本模块版本为 v1.2.0，依赖主模块 v1.4.0。下方完整示例已在发布检查中构建，并运行独立和共享两种模式。
+本模块版本为 v1.2.1，依赖主模块 v1.4.1。下方完整示例的构建及独立、共享两种模式运行记录来自此前发布检查。
 
 ## 按需引入
 
@@ -23,20 +23,20 @@ go 1.27
 
 require (
 	github.com/gin-gonic/gin v1.12.0
-	github.com/gtkit/gincache v1.4.0
-	github.com/gtkit/gincache/persist/ristrettoadapter v1.2.0
+	github.com/gtkit/gincache v1.4.1
+	github.com/gtkit/gincache/persist/ristrettoadapter v1.2.1
 )
 
-replace github.com/gtkit/gincache v1.4.0 => ../gincache
+replace github.com/gtkit/gincache v1.4.1 => ../gincache
 
-replace github.com/gtkit/gincache/persist/ristrettoadapter v1.2.0 => ../gincache/persist/ristrettoadapter
+replace github.com/gtkit/gincache/persist/ristrettoadapter v1.2.1 => ../gincache/persist/ristrettoadapter
 ```
 
 上面的替换仅用于本地源码联调。使用发布版本时移除这些本地替换，再按需安装：
 
 ```bash
 # 只安装所选模块，不需要安装另外两个适配器。
-go get github.com/gtkit/gincache/persist/ristrettoadapter@v1.2.0
+go get github.com/gtkit/gincache@v1.4.1 github.com/gtkit/gincache/persist/ristrettoadapter@v1.2.1
 ```
 
 ## 完整示例：独立实例与共享实例

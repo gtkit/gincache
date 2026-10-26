@@ -44,8 +44,8 @@ github.com/goccy/go-yaml v1.19.2/go.mod h1:XBurs7gK8ATbW4ZPGKgcbrY1Br56PdM69F7Lk
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
 github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
 github.com/google/gofuzz v1.0.0/go.mod h1:dBl0BpW6vV/+mYPU4Po3pmUjxk6FQPldtuIdl/M65Eg=
-github.com/gtkit/gincache v1.4.0 h1:gWZm4bPMmHhh8NffeDIgdqKLlIcyzQyh1RZldxlOeJ0=
-github.com/gtkit/gincache v1.4.0/go.mod h1:7AEgNxwFcdYC3bTlYmOfAtnFXuJ00XXprYZ4FweryF8=
+github.com/gtkit/gincache v1.4.1 h1:lOYqmFm7tPNfIk7/Jt9kiBlVcHG8X94wXepDXEVQq7Q=
+github.com/gtkit/gincache v1.4.1/go.mod h1:7AEgNxwFcdYC3bTlYmOfAtnFXuJ00XXprYZ4FweryF8=
 github.com/gtkit/json v1.0.0 h1:xIFbtGXMja9N0TBWZrULjrbBiX0o6ub8pOsKJgnM6Z0=
 github.com/gtkit/json v1.0.0/go.mod h1:q2xkdpGhFZnzCmk+ZBD/tsNGwqlwI/TZ1VWKLV9jOFo=
 github.com/json-iterator/go v1.1.12 h1:PV8peI4a0ysnczrg+LtxykD8LfKY9ML6u2jnxaEnrnM=

@@ -5,7 +5,7 @@ go 1.27
 require (
 	github.com/alicebob/miniredis/v2 v2.40.0
 	github.com/dgraph-io/ristretto/v2 v2.4.2
-	github.com/gtkit/gincache v1.4.0
+	github.com/gtkit/gincache v1.4.1
 	github.com/gtkit/json v1.0.0
 	github.com/redis/go-redis/v9 v9.23.0
 )
